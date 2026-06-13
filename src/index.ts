@@ -13,7 +13,7 @@ import { askCustomPrompt, askInteractiveChoice, renderUserEcho } from './prompt.
 import { setAutoApprove, isAutoApprove, undoLast, runValidation, resolveValidateCommand, isGitRepo, runGit } from './tools.js';
 import { setMode, isPlanMode, getModeLabel } from './mode.js';
 import { loadProjectContext } from './context.js';
-import { saveSession, loadSession, newSessionId, generateSessionTitle, type SavedSession } from './session.js';
+import { saveSession, loadSession, newSessionId, generateSessionTitle, fallbackTitle, type SavedSession } from './session.js';
 
 // Disable standard Ctrl+C process termination globally
 process.on('SIGINT', () => {});
@@ -376,6 +376,7 @@ async function runInteractive(agent: AinaAgent, client: OpenAI, resume?: SavedSe
       const firstUser = agent.getHistory().find((m) => m.role === 'user');
       const firstText = typeof firstUser?.content === 'string' ? firstUser.content : '';
       if (firstText.trim()) {
+        sessionTitle = fallbackTitle(firstText);
         titleRequested = true;
         generateSessionTitle(client, agent.getModel(), firstText)
           .then((t) => {
@@ -385,7 +386,7 @@ async function runInteractive(agent: AinaAgent, client: OpenAI, resume?: SavedSe
               title: sessionTitle,
               model: agent.getModel(),
               savedAt: '',
-              messages: agent.getHistory(),
+              messages: agent.getSanitizedHistory(),
             });
           })
           .catch(() => {});
@@ -396,7 +397,7 @@ async function runInteractive(agent: AinaAgent, client: OpenAI, resume?: SavedSe
       title: sessionTitle,
       model: agent.getModel(),
       savedAt: '',
-      messages: agent.getHistory(),
+      messages: agent.getSanitizedHistory(),
     });
   };
 
@@ -600,7 +601,12 @@ Write it in the user's language. If AINA.md already exists, update its contents.
               console.log(chalk.gray('Context is already compact — nothing changed.'));
             }
           } catch {
-            console.log(chalk.yellow('Compaction failed (gateway error). History left unchanged.'));
+            const { before, after } = agent.compactLocal();
+            if (after < before) {
+              console.log(chalk.yellow(`Model compaction failed; local fallback compacted active history: ~${formatTokens(before)} → ~${formatTokens(after)} token.`));
+            } else {
+              console.log(chalk.yellow('Model compaction failed; local fallback found nothing to shrink.'));
+            }
           }
           continue;
         } else if (cmd === '/usage') {
@@ -608,7 +614,10 @@ Write it in the user's language. If AINA.md already exists, update its contents.
           const pct = Math.min(100, Math.round((u.contextTokens / u.budget) * 100));
           console.log(chalk.bold.yellow('Usage:'));
           console.log(`  ${chalk.gray('Turns this session')} : ${u.turns}`);
-          console.log(`  ${chalk.gray('Tokens used (API)')}  : ${formatTokens(u.sessionTokens)}`);
+          console.log(`  ${chalk.gray('Tokens input')}      : ${formatTokens(u.promptTokens)}`);
+          console.log(`  ${chalk.gray('Tokens output')}     : ${formatTokens(u.completionTokens)}`);
+          console.log(`  ${chalk.gray('Tokens total')}      : ${formatTokens(u.sessionTokens)}`);
+          console.log(`  ${chalk.gray('Cost estimate')}     : ${u.estimatedCostUsd === null ? 'unavailable' : `$${u.estimatedCostUsd.toFixed(4)}`}`);
           console.log(`  ${chalk.gray('Context (est.)')}     : ~${formatTokens(u.contextTokens)} / ${formatTokens(u.budget)} (${pct}%)`);
           console.log(chalk.gray('  Tip: /compact to shrink the context.'));
           continue;
@@ -667,7 +676,8 @@ Write it in the user's language. If AINA.md already exists, update its contents.
           console.log(`  ${chalk.gray('Session')}     : ${sessionTitle || 'Untitled'} (${sessionId.slice(0, 8)})`);
           console.log(`  ${chalk.gray('Project ctx')} : ${ctx ? ctx.fileName : chalk.gray('none')}`);
           console.log(`  ${chalk.gray('Turns')}       : ${u.turns}`);
-          console.log(`  ${chalk.gray('Tokens (API)')}: ${formatTokens(u.sessionTokens)}`);
+          console.log(`  ${chalk.gray('Tokens')}      : ${formatTokens(u.sessionTokens)} (${formatTokens(u.promptTokens)} in / ${formatTokens(u.completionTokens)} out)`);
+          console.log(`  ${chalk.gray('Cost est.')}   : ${u.estimatedCostUsd === null ? 'unavailable' : `$${u.estimatedCostUsd.toFixed(4)}`}`);
           console.log(`  ${chalk.gray('Context')}     : ~${formatTokens(u.contextTokens)} / ${formatTokens(u.budget)} (${pct}%)`);
           continue;
         } else if (cmd === '/help') {

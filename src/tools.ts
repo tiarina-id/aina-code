@@ -115,7 +115,7 @@ export const toolsList: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'read_file',
-      description: 'Read the contents of a file from the local filesystem. Output is returned with line numbers (like "cat -n"), which helps target edits. Large files are truncated; use offset/limit to page through them.',
+      description: 'Read text from a local file with line numbers. Large files are capped; use query for a targeted excerpt or offset/limit to page through content.',
       parameters: {
         type: 'object',
         properties: {
@@ -130,6 +130,10 @@ export const toolsList: ToolDefinition[] = [
           limit: {
             type: 'number',
             description: 'Optional maximum number of lines to read starting at offset.'
+          },
+          query: {
+            type: 'string',
+            description: 'Optional text or regex to return an excerpt around the first matching line.'
           }
         },
         required: ['path']
@@ -579,6 +583,7 @@ async function confirmMutation(promptText: string, targetPath: string, preview?:
 
 // Batas jumlah baris hasil grep agar tidak membanjiri context window.
 const MAX_GREP_RESULTS = 200;
+const MAX_LIST_DIR_ENTRIES = 500;
 
 // Bangun pencocok baris untuk grep_search. Coba perlakukan query sebagai regex
 // (case-insensitive); jika polanya invalid, jatuh ke pencocokan substring literal
@@ -624,12 +629,22 @@ function tryRipgrep(query: string, dir: string): string[] | null {
     const lines = (r.stdout || '')
       .split('\n')
       .filter((l) => l.length > 0)
-      // rg memberi path relatif terhadap `dir`; jadikan absolut agar serupa output JS.
       .map((l) => `${dir}${path.sep}${l.replace(/^\.[\\/]/, '')}`);
     return lines.slice(0, MAX_GREP_RESULTS);
   } catch {
     return null;
   }
+}
+
+function formatGrepResults(results: string[]): string[] {
+  return results.map((line) => {
+    const match = line.match(/^(.*?):(\d+):(.*)$/);
+    if (!match) return line;
+    const [, filePath, lineNo, content] = match;
+    const rel = path.relative(sessionCwd, filePath).replace(/\\/g, '/');
+    const displayPath = rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel : filePath;
+    return `${displayPath}:${lineNo}:${content}`;
+  });
 }
 
 // Function to recursively search files for grep_search. Menghormati .gitignore
@@ -750,8 +765,30 @@ function findFilesByName(
 }
 
 // Cap default pembacaan file agar file besar tidak menghabiskan context window.
-const READ_MAX_LINES = 2000;
-const READ_MAX_BYTES = 100 * 1024;
+const READ_MAX_LINES = 500;
+const READ_MAX_BYTES = 30 * 1024;
+const READ_EXCERPT_CONTEXT_LINES = 80;
+const MINIFIED_AVG_LINE_LENGTH = 500;
+const MINIFIED_MAX_LINE_LENGTH = 4000;
+
+function looksBinary(buffer: Buffer): boolean {
+  if (buffer.includes(0)) return true;
+  const sample = buffer.subarray(0, Math.min(buffer.length, 4096));
+  if (sample.length === 0) return false;
+  let suspicious = 0;
+  for (const byte of sample) {
+    if (byte === 9 || byte === 10 || byte === 13) continue;
+    if (byte < 32 || byte === 127) suspicious++;
+  }
+  return suspicious / sample.length > 0.05;
+}
+
+function looksMinified(lines: string[]): boolean {
+  if (lines.length === 0) return false;
+  const longest = Math.max(...lines.map((line) => line.length));
+  const avg = lines.reduce((sum, line) => sum + line.length, 0) / lines.length;
+  return longest >= MINIFIED_MAX_LINE_LENGTH || (lines.length <= 5 && avg >= MINIFIED_AVG_LINE_LENGTH);
+}
 
 // Baca file dan kembalikan output bernomor baris gaya "cat -n". Mendukung
 // offset (baris awal 1-based) & limit (jumlah baris). Tanpa keduanya, dibatasi
@@ -759,9 +796,15 @@ const READ_MAX_BYTES = 100 * 1024;
 export function readFileWithLineNumbers(
   filePath: string,
   offset?: number,
-  limit?: number
+  limit?: number,
+  query?: string
 ): string {
-  let content = fs.readFileSync(filePath, 'utf8');
+  const buffer = fs.readFileSync(filePath);
+  if (looksBinary(buffer)) {
+    return `Error: ${filePath} appears to be binary or non-text; use a specialized tool instead of read_file.`;
+  }
+
+  let content = buffer.toString('utf8');
   let bytesTruncated = false;
   if (Buffer.byteLength(content, 'utf8') > READ_MAX_BYTES) {
     content = content.slice(0, READ_MAX_BYTES);
@@ -771,8 +814,25 @@ export function readFileWithLineNumbers(
   const allLines = content.split('\n');
   const totalLines = allLines.length;
 
-  const start = offset && offset > 0 ? offset - 1 : 0;
-  const explicitLimit = limit && limit > 0 ? limit : undefined;
+  if (!offset && !limit && looksMinified(allLines)) {
+    return `Error: ${filePath} appears minified or generated (${totalLines} lines, very long lines). Use grep_search for targeted matches or read_file with offset/limit if you really need an excerpt.`;
+  }
+
+  let start = offset && offset > 0 ? offset - 1 : 0;
+  let queryNote = '';
+  let effectiveLimit = limit;
+  if (query && !offset) {
+    const matcher = buildLineMatcher(query);
+    const matchIndex = allLines.findIndex((line) => matcher(line));
+    if (matchIndex === -1) {
+      return `No lines match query ${JSON.stringify(query)} in ${filePath}.`;
+    }
+    start = Math.max(0, matchIndex - READ_EXCERPT_CONTEXT_LINES);
+    const excerptEnd = Math.min(allLines.length, matchIndex + READ_EXCERPT_CONTEXT_LINES + 1);
+    effectiveLimit = Math.min(limit && limit > 0 ? limit : excerptEnd - start, READ_MAX_LINES);
+    queryNote = `... (excerpt around first match for ${JSON.stringify(query)} at line ${matchIndex + 1})`;
+  }
+  const explicitLimit = effectiveLimit && effectiveLimit > 0 ? Math.min(effectiveLimit, READ_MAX_LINES) : undefined;
   const maxLines = explicitLimit ?? READ_MAX_LINES;
   const end = Math.min(allLines.length, start + maxLines);
 
@@ -787,6 +847,7 @@ export function readFileWithLineNumbers(
     .join('\n');
 
   const notes: string[] = [];
+  if (queryNote) notes.push(queryNote);
   if (end < totalLines) {
     notes.push(`... (${totalLines - end} more lines not shown; use offset=${end + 1} to continue)`);
   }
@@ -1002,7 +1063,7 @@ export async function executeTool(name: string, args: any): Promise<string> {
         if (!stats.isFile()) {
           return `Error: ${args.path} is not a file.`;
         }
-        return readFileWithLineNumbers(targetPath, args.offset, args.limit);
+        return readFileWithLineNumbers(targetPath, args.offset, args.limit, args.query);
       } catch (err: any) {
         return `Error reading file: ${err.message}`;
       }
@@ -1052,13 +1113,17 @@ export async function executeTool(name: string, args: any): Promise<string> {
         if (!stats.isDirectory()) {
           return `Error: ${args.path} is not a directory.`;
         }
-        const files = fs.readdirSync(targetPath);
-        const resultLines = files.map(file => {
+        const files = fs.readdirSync(targetPath).sort((a, b) => a.localeCompare(b));
+        const shownFiles = files.slice(0, MAX_LIST_DIR_ENTRIES);
+        const resultLines = shownFiles.map(file => {
           const fPath = path.join(targetPath, file);
           const fStats = fs.statSync(fPath);
           const type = fStats.isDirectory() ? 'DIR' : 'FILE';
           return `${type.padEnd(6)} ${file}`;
         });
+        if (files.length > shownFiles.length) {
+          resultLines.push(`... (${files.length - shownFiles.length} more entries not shown; narrow the path)`);
+        }
         return resultLines.length > 0 ? resultLines.join('\n') : '(empty directory)';
       } catch (err: any) {
         return `Error listing directory: ${err.message}`;
@@ -1148,7 +1213,7 @@ export async function executeTool(name: string, args: any): Promise<string> {
         if (results.length === 0) {
           return `No matches found for query: "${args.query}"`;
         }
-        let out = results.join('\n');
+        let out = formatGrepResults(results).join('\n');
         if (results.length >= MAX_GREP_RESULTS) {
           out += `\n... (results truncated at ${MAX_GREP_RESULTS} lines; narrow your query)`;
         }

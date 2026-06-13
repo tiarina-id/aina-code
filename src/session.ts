@@ -72,7 +72,7 @@ function readLastSessionId(): string | null {
 
 // Build a short, human-friendly title from the first user message. Used as a
 // fallback when the LLM title call fails.
-function fallbackTitle(firstUserMessage: string): string {
+export function fallbackTitle(firstUserMessage: string): string {
   const cleaned = firstUserMessage.replace(/\s+/g, ' ').trim();
   if (!cleaned) return 'Untitled session';
   return cleaned.length > 60 ? `${cleaned.slice(0, 57)}...` : cleaned;

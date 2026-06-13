@@ -89,7 +89,7 @@ aina --help                            # print help
 | `/commit "message"` | Stage all & commit (with confirmation) |
 | `/resume` | Resume your previous session |
 | `/compact` | Summarize & shrink the conversation context |
-| `/usage` | Show session token usage & context size |
+| `/usage` | Show input/output token usage, cost estimate & context size |
 | `/status` | Show model, mode, directory, session & usage |
 | `/config [key value]` | Show or change configuration |
 | `/plan` | Toggle Plan mode (read-only, plan only) |
@@ -129,7 +129,27 @@ search and the file picker respect your `.gitignore`.
 - Files you read or `@`-attach, and commands you run, are sent to the
   `api.tiarina.id` gateway as part of the context. Respecting `.gitignore` helps
   avoid sending secrets (e.g. `.env`) by accident.
-- Your resumable session history is stored locally at `~/.ainacode/session.json`.
+- Your resumable session history is stored locally under
+  `~/.ainacode/sessions/<uuid>.json`, with the latest pointer at
+  `~/.ainacode/last-session.json`.
+- `/usage` shows prompt/completion/total tokens plus a best-effort cost estimate
+  for known Aina models; unknown model prices are shown as unavailable.
+- `diag.mjs` requires a real API key from `AINA_API_KEY` or config and exits
+  clearly when none is configured.
+
+## Platform Notes
+
+- Linux and macOS terminals are the primary supported environments.
+- Windows dangerous-command detection is included. For best results, use Windows
+  Terminal with PowerShell and Node.js 18+.
+- Full raw TTY/ANSI behavior is best-effort on Windows and has not been fully
+  verified in this audit, so avoid claiming full Windows support until tested on
+  native Windows terminals.
+
+## Quality Gate
+
+- CI runs `npm run build`, `npm test`, and `npm run lint` on push and pull
+  requests.
 
 ## License
 

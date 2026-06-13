@@ -9,45 +9,22 @@ import { renderMarkdown } from "./markdown.js";
 import { isPlanMode, footerRight } from "./mode.js";
 import { loadProjectContext, formatProjectContext } from "./context.js";
 
-const SYSTEM_PROMPT = `You are Aina, a helpful, precise, and powerful AI coding assistant CLI.
-You have access to tools to inspect the user's filesystem, edit code, and execute command line tasks.
-Your default language of communication should match the user's language (for example Indonesian or English).
-Be direct, concise, and professional. Briefly explain what you are about to do before using tools.
+const SYSTEM_PROMPT = `You are Aina, a concise and precise coding assistant CLI.
+Match the user's language. Explain briefly before tool use.
 
-Core working rules:
-- Understand the existing project before making changes. Inspect relevant files, configs, schemas, tests, and nearby patterns first.
-- Solve the user's request at the root cause when possible, while keeping changes minimal and focused.
-- Do not change unrelated code, rename things unnecessarily, or introduce large rewrites unless the user asked for them.
-- Follow the style, architecture, naming, and conventions already present in the repository.
-- If requirements are ambiguous, infer safely from the repo when possible. Ask the user only when the decision materially changes behavior and cannot be discovered locally.
+Work rules:
+- Inspect relevant files/config/tests first; follow existing style.
+- Fix root causes with minimal focused changes; avoid unrelated edits.
+- Infer safely from the repo; ask only for decisions that materially change behavior.
+- Never claim file/command actions unless you used the matching tool.
+- Prefer read_file before edits, edit_file for small changes, write_file for new/full rewrites.
+- Use find_files/grep_search/list_dir for discovery and run_command for builds/tests/git inspection.
+- Use ask_user only for genuine ambiguity requiring a structured choice.
+- If content appears under "Attached files", use it directly instead of re-reading.
+- After code changes, run relevant validation when feasible; report unrelated failures without fixing them.
+- Final coding answers should summarize changed files and validation.
 
-Tool usage rules:
-- ALWAYS use the provided tools to perform real actions. Do not claim a file was created, edited, deleted, moved, or that a command ran unless you actually called the matching tool.
-- Use 'read_file' to inspect a file before editing it. Prefer 'edit_file' (exact string replacement) for small changes and 'write_file' only for new files or full rewrites.
-- Use 'find_files' to locate files by name and 'grep_search' to search inside file contents.
-- Use 'list_dir' to explore directories, 'make_dir' to create folders, 'delete_file' to remove a file, and 'move_file' to move/rename.
-- Use 'run_command' for commands, tests, builds, package scripts, git inspection, or anything not covered by the other tools.
-- Use 'ask_user' to ask 1-3 structured multiple-choice questions when requirements are genuinely ambiguous, when you need the user to choose a direction, or to confirm a decision that materially changes behavior. Provide clear options (with short descriptions) and set multiSelect when several answers may apply. Do NOT use it for things you can discover from the repo; prefer inferring safely.
-- When a file is provided inline in the user's message (under an "Attached files" section), use its contents directly instead of re-reading it.
-
-Validation rules:
-- After code changes, run the most relevant test, typecheck, build, or lint command when feasible.
-- Start with targeted validation near the changed code, then use broader validation when appropriate.
-- Do not fix unrelated failing tests or unrelated lint errors; report them clearly instead.
-- If validation is skipped or cannot run, explain the reason briefly.
-
-Response guidelines:
-- Use markdown for clarity, but avoid excessive decoration. Prefer short bullets and compact sections for coding updates.
-- Use tables only when they make structured comparisons easier to scan.
-- Wrap code blocks with the correct syntax highlighting language tag when including code.
-- Final answers for completed coding work should summarize what changed, name the relevant files, and list validation performed.
-- Do not overuse emojis; use them only when they improve readability.
-
-When you want the user to choose between multiple options or files, present the choices as a numbered list at the very end of your response. For example:
-1. Option A
-2. Option B
-This enables the interactive dropdown menu in the CLI.
-`;
+For interactive choices, put a numbered list at the very end so the CLI can render a selector.`;
 
 // Injected as a transient system message (only while plan mode is active). It is
 // NOT persisted to history, so switching modes takes effect immediately without
@@ -243,6 +220,22 @@ export function parseChoices(
 }
 
 const MAX_ATTACH_BYTES = 50 * 1024; // 50 KB cap per attached file
+const MAX_TOOL_RESULT_BYTES = 32 * 1024;
+const MAX_COMPLETION_TOKENS = 4096;
+const TOOL_RESULT_EVICT_AFTER_REQUESTS = 1;
+const STREAM_FALLBACK_FLUSH_MS = 400;
+const STREAM_FALLBACK_FLUSH_CHARS = 240;
+const VALIDATION_PREFIX = "Automatic validation (";
+const ATTACHMENTS_MARKER = "\n\nAttached files:\n";
+const READ_ONLY_TOOL_NAMES = new Set([
+  "read_file",
+  "list_dir",
+  "grep_search",
+  "find_files",
+  "git_status",
+  "git_diff",
+  "ask_user",
+]);
 
 // Potong string ke maksimum `maxBytes` byte UTF-8 tanpa memecah karakter multibyte
 // (memotong per-karakter bisa jauh melebihi cap byte untuk teks Unicode).
@@ -253,6 +246,179 @@ export function truncateToBytes(s: string, maxBytes: number): string {
   // Buang karakter pengganti di ujung bila byte multibyte terakhir terpotong.
   if (out.endsWith("�")) out = out.slice(0, -1);
   return out;
+}
+
+export function summarizeToolResult(name: string, args: any, result: string): string {
+  const pathLike = args?.path ?? args?.source ?? args?.pattern ?? args?.query ?? "";
+  const lineCount = result ? result.split("\n").length : 0;
+  const bytes = Buffer.byteLength(result ?? "", "utf8");
+  const target = pathLike ? `: ${String(pathLike)}` : "";
+  return `[${name}${target} — ${lineCount} lines, ${bytes} bytes; previous tool result summarized]`;
+}
+
+export function capToolResult(name: string, args: any, result: string): string {
+  if (Buffer.byteLength(result, "utf8") <= MAX_TOOL_RESULT_BYTES) return result;
+  const capped = truncateToBytes(result, MAX_TOOL_RESULT_BYTES);
+  const hint =
+    name === "read_file"
+      ? "Use read_file with offset/limit to inspect the omitted portion."
+      : name === "grep_search"
+        ? "Narrow the query or path to inspect more matches."
+        : "Narrow the request to inspect the omitted portion.";
+  return `${capped}\n... (tool result truncated at ${MAX_TOOL_RESULT_BYTES / 1024}KB. ${hint})`;
+}
+
+export function countCodeFences(s: string): number {
+  return (s.match(/^```/gm) || []).length;
+}
+
+export function findFlushBoundary(
+  pending: string,
+  force = false,
+  minChars = STREAM_FALLBACK_FLUSH_CHARS,
+): number {
+  let from = 0;
+  while (true) {
+    const idx = pending.indexOf("\n\n", from);
+    if (idx === -1) break;
+    if (countCodeFences(pending.slice(0, idx)) % 2 === 0) return idx;
+    from = idx + 1;
+  }
+  if (!force && pending.length < minChars) return -1;
+  if (countCodeFences(pending) % 2 !== 0) return -1;
+
+  const newline = pending.lastIndexOf("\n");
+  if (newline > 0) return newline;
+
+  if (!force && pending.length >= minChars) {
+    const softBreak = pending.lastIndexOf(" ", minChars);
+    if (softBreak > 0) return softBreak;
+  }
+  return force && pending.trim() ? pending.length : -1;
+}
+
+export function compactAttachedFilesContent(content: string): string {
+  const idx = content.indexOf(ATTACHMENTS_MARKER);
+  if (idx === -1) return content;
+  const prompt = content.slice(0, idx).trimEnd();
+  const attachments = content.slice(idx + ATTACHMENTS_MARKER.length);
+  const fileRefs = Array.from(attachments.matchAll(/^--- (?:File|Directory): (.+) ---$/gm))
+    .map((m) => m[1].trim())
+    .filter(Boolean);
+  const summary = fileRefs.length > 0
+    ? fileRefs.map((f) => `- ${f}`).join("\n")
+    : "- attached content processed earlier";
+  return `${prompt}\n\n[Attached file contents summarized after processing; referenced paths:]\n${summary}`;
+}
+
+export function sanitizeHistoryForSave(
+  messages: OpenAI.Chat.ChatCompletionMessageParam[],
+): OpenAI.Chat.ChatCompletionMessageParam[] {
+  const lastValidation = [...messages]
+    .reverse()
+    .findIndex((m: any) => m.role === "system" && typeof m.content === "string" && m.content.startsWith(VALIDATION_PREFIX));
+  const validationKeepIndex = lastValidation === -1 ? -1 : messages.length - 1 - lastValidation;
+  return messages.flatMap((message, idx) => {
+    const anyMessage = message as any;
+    if (anyMessage.role === "system" && typeof anyMessage.content === "string" && anyMessage.content.startsWith(VALIDATION_PREFIX) && idx !== validationKeepIndex) {
+      return [];
+    }
+    if (anyMessage.role === "user" && typeof anyMessage.content === "string") {
+      const content = compactAttachedFilesContent(anyMessage.content);
+      if (content !== anyMessage.content) return [{ ...message, content }];
+    }
+    return [message];
+  });
+}
+
+function isValidationMessage(message: OpenAI.Chat.ChatCompletionMessageParam): boolean {
+  const anyMessage = message as any;
+  return anyMessage.role === "system" && typeof anyMessage.content === "string" && anyMessage.content.startsWith(VALIDATION_PREFIX);
+}
+
+export function sanitizeActiveHistory(
+  messages: OpenAI.Chat.ChatCompletionMessageParam[],
+): OpenAI.Chat.ChatCompletionMessageParam[] {
+  return sanitizeHistoryForSave(messages);
+}
+
+export function locallyCompactHistoryForSerialization(
+  messages: OpenAI.Chat.ChatCompletionMessageParam[],
+): OpenAI.Chat.ChatCompletionMessageParam[] {
+  const sanitized = sanitizeHistoryForSave(messages);
+  const lastValidationIndex = sanitized.map(isValidationMessage).lastIndexOf(true);
+
+  return sanitized.map((message, idx) => {
+    const anyMessage = message as any;
+    if (anyMessage.role === "tool" && typeof anyMessage.content === "string") {
+      return {
+        ...message,
+        content: capToolResult("tool", {}, anyMessage.content),
+      };
+    }
+    if (isValidationMessage(message) && idx !== lastValidationIndex) {
+      return {
+        ...message,
+        content: "[Older validation result omitted; latest validation result is kept later in history.]",
+      };
+    }
+    return message;
+  });
+}
+
+export function estimateHistoryTokens(messages: OpenAI.Chat.ChatCompletionMessageParam[]): number {
+  return messages.reduce((sum, message: any) => {
+    const content = typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
+    const tools = message.tool_calls ? JSON.stringify(message.tool_calls) : "";
+    return sum + Math.ceil((content.length + tools.length) / 4) + 4;
+  }, 0);
+}
+
+export type RequestToolPolicy =
+  | { tools: typeof toolsList; tool_choice?: never }
+  | { tools?: never; tool_choice: "none" };
+
+export function chooseRequestToolPolicy(options: {
+  planMode: boolean;
+  toolsNeeded: boolean;
+}): RequestToolPolicy {
+  if (!options.toolsNeeded) return { tool_choice: "none" };
+  if (!options.planMode) return { tools: toolsList };
+  return {
+    tools: toolsList.filter((tool) => READ_ONLY_TOOL_NAMES.has(tool.function.name)),
+  };
+}
+
+const COST_PER_MILLION_TOKENS_USD: Record<string, { input: number; output: number }> = {
+  "aina-1-flash": { input: 0.15, output: 0.6 },
+  "aina-1-mini": { input: 0.3, output: 1.2 },
+  "aina-1-pro": { input: 2.5, output: 10 },
+  "aina-1-ultra": { input: 5, output: 20 },
+};
+
+export function estimateUsageCostUsd(
+  model: string,
+  promptTokens: number,
+  completionTokens: number,
+): number | null {
+  const pricing = COST_PER_MILLION_TOKENS_USD[model.toLowerCase()];
+  if (!pricing) return null;
+  return (promptTokens / 1_000_000) * pricing.input + (completionTokens / 1_000_000) * pricing.output;
+}
+
+export function normalizeUsageDelta(usage: any): {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+} {
+  const promptTokens = typeof usage?.prompt_tokens === "number" ? usage.prompt_tokens : 0;
+  const completionTokens = typeof usage?.completion_tokens === "number" ? usage.completion_tokens : 0;
+  const reportedTotal = typeof usage?.total_tokens === "number" ? usage.total_tokens : 0;
+  const totalTokens = reportedTotal || promptTokens + completionTokens;
+  if (promptTokens === 0 && completionTokens === 0 && totalTokens > 0) {
+    return { promptTokens: totalTokens, completionTokens: 0, totalTokens };
+  }
+  return { promptTokens, completionTokens, totalTokens };
 }
 
 // Expand "@path" tags in the user's input by reading the referenced files/dirs
@@ -324,9 +490,10 @@ function isContextLengthError(error: any): boolean {
 }
 
 // Map common API/network failures to friendly English messages.
-function friendlyError(error: any): string {
+export function friendlyError(error: any): string {
   const status = error?.status || error?.statusCode;
   const code = error?.code || "";
+  const message = String(error?.message || "");
   if (status === 401 || status === 403) {
     return "Error: API key is invalid or rejected. Check AINA_API_KEY or ~/.ainacode/config.json.";
   }
@@ -337,9 +504,12 @@ function friendlyError(error: any): string {
     return "Error: model not found on the gateway. Check the model name (/model) — choices: aina-1-flash, aina-1-mini, aina-1-pro, aina-1-ultra.";
   }
   if (typeof status === "number" && status >= 500) {
-    return `Error: gateway server problem (HTTP ${status}). Try again later.`;
+    return `Error: gateway server problem (HTTP ${status}). The request may have been retried; try again later.`;
   }
-  if (["ENOTFOUND", "ECONNREFUSED", "ETIMEDOUT", "ECONNRESET"].includes(code)) {
+  if (code === "ETIMEDOUT" || code === "ECONNRESET" || /timeout|timed out|aborted/i.test(message)) {
+    return "Error: gateway request timed out or was interrupted after retries. Check your connection/AINA_BASE_URL and try again.";
+  }
+  if (["ENOTFOUND", "ECONNREFUSED"].includes(code)) {
     return "Error: failed to connect to the server. Check your internet connection / AINA_BASE_URL.";
   }
   return `Execution error: ${error?.message || String(error)}`;
@@ -481,10 +651,16 @@ export class AinaAgent {
   private messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
   private lastChoices: { question: string; options: string[] } | null = null;
   private lastPlan: string | null = null;
-  // Statistik pemakaian sesi (untuk /usage & /status). sessionTokens menjumlah
-  // token yang dilaporkan gateway tiap giliran; turnCount menghitung giliran.
+  // Statistik pemakaian sesi (untuk /usage & /status). Gateway modern memberi
+  // prompt/completion; sebagian gateway lama hanya memberi total.
   private sessionTokens = 0;
+  private promptTokens = 0;
+  private completionTokens = 0;
   private turnCount = 0;
+  private requestGeneration = 0;
+  private readonly toolResultGenerations = new WeakMap<object, number>();
+  private readonly toolResultSummaries = new WeakMap<object, string>();
+  private readonly readFileCache = new Map<string, string>();
   // Pesan system awal: SYSTEM_PROMPT + (opsional) konteks proyek dari
   // AINA.md/CLAUDE.md/AGENT.md. Dihitung sekali saat konstruksi agar /clear bisa
   // memulihkannya tanpa membaca ulang disk.
@@ -526,6 +702,8 @@ export class AinaAgent {
     this.messages = this.seedMessages.map((m) => ({ ...m }));
     this.lastChoices = null;
     this.lastPlan = null;
+    this.requestGeneration = 0;
+    this.readFileCache.clear();
   }
 
   // Riwayat percakapan saat ini (untuk persistensi sesi).
@@ -533,17 +711,63 @@ export class AinaAgent {
     return this.messages;
   }
 
+  getSanitizedHistory(): OpenAI.Chat.ChatCompletionMessageParam[] {
+    return locallyCompactHistoryForSerialization(this.messages);
+  }
+
   // Pulihkan riwayat percakapan dari sesi tersimpan (slash /resume).
   restoreHistory(messages: OpenAI.Chat.ChatCompletionMessageParam[]): void {
     this.messages = messages;
     this.lastChoices = null;
     this.lastPlan = null;
+    this.requestGeneration = 0;
+    this.readFileCache.clear();
+  }
+
+  private requestToolPolicy(toolsNeeded = true): RequestToolPolicy {
+    return chooseRequestToolPolicy({ planMode: isPlanMode(), toolsNeeded });
+  }
+
+  private evictStaleToolResults(): void {
+    for (const message of this.messages) {
+      const anyMessage = message as any;
+      if (anyMessage.role !== "tool") continue;
+      const generation = this.toolResultGenerations.get(message as object);
+      if (generation === undefined) continue;
+      if (this.requestGeneration - generation < TOOL_RESULT_EVICT_AFTER_REQUESTS) {
+        continue;
+      }
+      const summary = this.toolResultSummaries.get(message as object);
+      if (summary && anyMessage.content !== summary) {
+        anyMessage.content = summary;
+      }
+    }
+  }
+
+  private readFileCacheKey(args: any): string {
+    const rawPath = String(args?.path ?? "");
+    const resolved = rawPath ? path.resolve(rawPath) : rawPath;
+    return JSON.stringify({
+      path: resolved,
+      offset: args?.offset ?? null,
+      limit: args?.limit ?? null,
+    });
+  }
+
+  private invalidateReadFileCacheForMutation(name: string, args: any): void {
+    if (!["write_file", "edit_file", "multi_edit", "delete_file", "move_file"].includes(name)) {
+      return;
+    }
+    this.readFileCache.clear();
   }
 
   // Statistik pemakaian sesi + estimasi ukuran konteks saat ini (slash /usage,
   // /status). `budget` adalah ambang yang memicu kompaksi otomatis.
   getUsage(): {
     sessionTokens: number;
+    promptTokens: number;
+    completionTokens: number;
+    estimatedCostUsd: number | null;
     turns: number;
     contextTokens: number;
     budget: number;
@@ -554,6 +778,9 @@ export class AinaAgent {
     );
     return {
       sessionTokens: this.sessionTokens,
+      promptTokens: this.promptTokens,
+      completionTokens: this.completionTokens,
+      estimatedCostUsd: estimateUsageCostUsd(this.model, this.promptTokens, this.completionTokens),
       turns: this.turnCount,
       contextTokens,
       budget: 100_000,
@@ -568,6 +795,12 @@ export class AinaAgent {
     const before = measure();
     await this.compactHistory(undefined, true);
     return { before, after: measure() };
+  }
+
+  compactLocal(): { before: number; after: number } {
+    const before = estimateHistoryTokens(this.messages);
+    this.messages = locallyCompactHistoryForSerialization(this.messages);
+    return { before, after: estimateHistoryTokens(this.messages) };
   }
 
   // Build the messages array for an API request. In plan mode a transient system
@@ -711,6 +944,7 @@ export class AinaAgent {
       role: "user",
       content: expandFileTags(userInput),
     });
+    this.messages = sanitizeActiveHistory(this.messages);
 
     // Gap between the echoed user prompt and the process output below.
     console.log();
@@ -727,8 +961,10 @@ export class AinaAgent {
     let iterations = 0;
     // Allow exactly one automatic retry after trimming on a context-length error.
     let retriedContext = false;
-    // Total tokens used across all completions in this run (for the summary line).
+    // Tokens used across all completions in this run (for summary & /usage).
     let totalTokens = 0;
+    let promptTokens = 0;
+    let completionTokens = 0;
     // True while raw assistant text is being streamed to the screen.
     let streamingNow = false;
 
@@ -801,13 +1037,16 @@ export class AinaAgent {
       } catch {
         this.trimHistory();
       }
+      this.evictStaleToolResults();
 
       try {
+        const requestPolicy = this.requestToolPolicy(true);
         const stream = await this.openai.chat.completions.create(
           {
             model: this.model,
             messages: this.buildRequestMessages(),
-            tools: toolsList as any,
+            ...(requestPolicy as any),
+            max_tokens: MAX_COMPLETION_TOKENS,
             stream: true,
             stream_options: { include_usage: true },
           },
@@ -833,9 +1072,7 @@ export class AinaAgent {
           streamingNow = true;
         };
 
-        // Count code-fence lines (``` at start of a line). A block is only safe to
-        // flush when the fences within it are balanced (even count).
-        const fenceCount = (s: string): number => (s.match(/^```/gm) || []).length;
+        let lastFlushAt = Date.now();
 
         // Render `raw` as markdown and append it to scrollback. spinner.log() clears
         // the status bar, prints, then redraws the bar — safe at any height.
@@ -849,33 +1086,30 @@ export class AinaAgent {
 
         // Flush every complete block at the front of the unprinted region, leaving
         // the trailing in-progress block buffered.
-        const flushBlocks = () => {
+        const flushBlocks = (force = false) => {
           while (true) {
             const pending = contentBuf.slice(flushedLen);
-            let from = 0;
-            let cut = -1;
-            while (true) {
-              const idx = pending.indexOf("\n\n", from);
-              if (idx === -1) break;
-              if (fenceCount(pending.slice(0, idx)) % 2 === 0) {
-                cut = idx;
-                break;
-              }
-              from = idx + 1; // boundary sits inside an open code fence — keep looking
-            }
+            const stale = Date.now() - lastFlushAt >= STREAM_FALLBACK_FLUSH_MS;
+            const cut = findFlushBoundary(pending, force || stale);
             if (cut === -1) break;
             printBlock(pending.slice(0, cut));
             // Consume the run of newlines separating this block from the next.
             let sep = cut;
+            if (sep < pending.length && pending[sep] === " ") sep++;
             while (contentBuf[flushedLen + sep] === "\n") sep++;
             flushedLen += sep;
+            lastFlushAt = Date.now();
           }
         };
 
         for await (const chunk of stream as any) {
           if (cancelled) break;
-          if (chunk?.usage?.total_tokens)
-            totalTokens += chunk.usage.total_tokens;
+          if (chunk?.usage) {
+            const usage = normalizeUsageDelta(chunk.usage);
+            promptTokens += usage.promptTokens;
+            completionTokens += usage.completionTokens;
+            totalTokens += usage.totalTokens;
+          }
           const delta = chunk?.choices?.[0]?.delta;
           if (!delta) continue;
           if (delta.content) {
@@ -901,9 +1135,10 @@ export class AinaAgent {
             }
           }
         }
+        this.requestGeneration++;
 
         // Catch any block that completed right at the end of the stream.
-        flushBlocks();
+        flushBlocks(true);
         streamingNow = false;
         acceptTyping = true;
 
@@ -1026,6 +1261,16 @@ export class AinaAgent {
                 result = `Error: tool '${name}' failed: ${toolErr?.message || String(toolErr)}`;
               }
             }
+            if (name === "read_file" && !result.startsWith("Error")) {
+              const cacheKey = this.readFileCacheKey(args);
+              const previousSummary = this.readFileCache.get(cacheKey);
+              if (previousSummary) {
+                result = `[read_file: ${args.path} — duplicate read omitted; refer to earlier result: ${previousSummary}]`;
+              } else {
+                this.readFileCache.set(cacheKey, summarizeToolResult(name, args, result));
+              }
+            }
+            result = capToolResult(name, args, result);
 
             if (isInteractive) {
               // Restart the spinner for next LLM turn
@@ -1048,6 +1293,7 @@ export class AinaAgent {
             ]);
             if (!isError && FILE_MUTATORS.has(name)) {
               mutatedThisRound = true;
+              this.invalidateReadFileCacheForMutation(name, args);
             }
 
             // Baris aktivitas tool gaya bersih: "⏺ Label(arg)" — satu titik
@@ -1101,11 +1347,17 @@ export class AinaAgent {
 
             spinner.log(historyLog + outputLog);
 
-            this.messages.push({
+            const toolMessage = {
               role: "tool",
               tool_call_id: toolCall.id,
               content: result,
-            } as OpenAI.Chat.ChatCompletionToolMessageParam);
+            } as OpenAI.Chat.ChatCompletionToolMessageParam;
+            this.messages.push(toolMessage);
+            this.toolResultGenerations.set(toolMessage as object, this.requestGeneration);
+            this.toolResultSummaries.set(
+              toolMessage as object,
+              summarizeToolResult(name, args, result),
+            );
           }
 
           // Feedback loop pasca-edit: setelah ada perubahan file, jalankan
@@ -1120,6 +1372,9 @@ export class AinaAgent {
                 spinner.log(chalk.green(`Validation: ${v.command} — passed`));
               } else {
                 spinner.log(chalk.yellow(`Validation: ${v.command} — issues found; Aina will fix them.`));
+                this.messages = this.messages.filter((m: any) =>
+                  !(m.role === "system" && typeof m.content === "string" && m.content.startsWith(VALIDATION_PREFIX)),
+                );
                 this.messages.push({
                   role: "system",
                   content: `Automatic validation (${v.command}) FOUND issues. Fix the ones relevant to your changes (ignore unrelated errors), then continue:\n\n${v.output}`,
@@ -1136,6 +1391,7 @@ export class AinaAgent {
             this.lastPlan = contentBuf;
           }
         }
+        this.messages = sanitizeActiveHistory(this.messages);
       } catch (error: any) {
         // Reset stream flags if an error/abort interrupted a buffered stream.
         if (streamingNow) {
@@ -1174,6 +1430,8 @@ export class AinaAgent {
     // Akumulasi statistik sesi untuk /usage & /status.
     this.turnCount++;
     this.sessionTokens += totalTokens;
+    this.promptTokens += promptTokens;
+    this.completionTokens += completionTokens;
     if (!cancelled) {
       const tokenStr =
         totalTokens > 0 ? ` · ${formatTokens(totalTokens)} token` : "";

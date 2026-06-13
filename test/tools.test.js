@@ -13,7 +13,7 @@ import {
   findFlexibleMatch,
   resolveValidateCommand,
 } from '../dist/tools.js';
-import { truncateToBytes } from '../dist/agent.js';
+import { capToolResult, summarizeToolResult, truncateToBytes } from '../dist/agent.js';
 import { loadIgnore } from '../dist/gitignore.js';
 import { setMode } from '../dist/mode.js';
 import { formatAskAnswers } from '../dist/prompt.js';
@@ -54,12 +54,57 @@ test('readFileWithLineNumbers: menghormati offset & limit', () => {
   assert.ok(!out.includes('3\tc'));
 });
 
+test('readFileWithLineNumbers: default cap memotong setelah 500 baris', () => {
+  const f = path.join(TMP, 'many-lines.txt');
+  fs.writeFileSync(f, Array.from({ length: 650 }, (_, i) => `line-${i + 1}`).join('\n'), 'utf8');
+  const out = readFileWithLineNumbers(f);
+  assert.ok(out.includes('500\tline-500'));
+  assert.ok(!out.includes('501\tline-501'));
+  assert.ok(out.includes('use offset=501 to continue'));
+});
+
+test('readFileWithLineNumbers: query mengembalikan excerpt sekitar match', () => {
+  const f = path.join(TMP, 'query.txt');
+  const lines = Array.from({ length: 220 }, (_, i) => (i === 150 ? 'needle target' : `line-${i + 1}`));
+  fs.writeFileSync(f, lines.join('\n'), 'utf8');
+  const out = readFileWithLineNumbers(f, undefined, undefined, 'needle');
+  assert.ok(out.includes('151\tneedle target'));
+  assert.ok(out.includes('excerpt around first match'));
+  assert.ok(!out.split('\n').some((line) => line.trimStart() === '1\tline-1'));
+});
+
+test('readFileWithLineNumbers: menolak binary dan minified default', () => {
+  const binary = path.join(TMP, 'binary.bin');
+  fs.writeFileSync(binary, Buffer.from([0, 1, 2, 3, 4, 5]));
+  assert.ok(readFileWithLineNumbers(binary).includes('appears to be binary'));
+
+  const minified = path.join(TMP, 'bundle.js');
+  fs.writeFileSync(minified, 'const x=' + '1+'.repeat(5000) + '0;', 'utf8');
+  assert.ok(readFileWithLineNumbers(minified).includes('appears minified'));
+  assert.ok(readFileWithLineNumbers(minified, 1, 1).includes('1\tconst x='));
+});
+
 test('truncateToBytes: tidak melebihi cap byte & aman Unicode', () => {
   assert.equal(truncateToBytes('héllo', 100), 'héllo');
   const long = 'é'.repeat(100); // tiap 'é' = 2 byte UTF-8
   const cut = truncateToBytes(long, 11);
   assert.ok(Buffer.byteLength(cut, 'utf8') <= 11);
   assert.ok(!cut.endsWith('�'));
+});
+
+test('capToolResult: memotong hasil tool besar dengan hint', () => {
+  const long = 'x'.repeat(40 * 1024);
+  const out = capToolResult('read_file', { path: 'big.txt' }, long);
+  assert.ok(Buffer.byteLength(out, 'utf8') < Buffer.byteLength(long, 'utf8'));
+  assert.ok(out.includes('tool result truncated'));
+  assert.ok(out.includes('offset/limit'));
+});
+
+test('summarizeToolResult: menghasilkan ringkasan pendek metadata tool', () => {
+  const out = summarizeToolResult('read_file', { path: 'src/agent.ts' }, 'a\nb\nc');
+  assert.ok(out.includes('read_file: src/agent.ts'));
+  assert.ok(out.includes('3 lines'));
+  assert.ok(out.includes('summarized'));
 });
 
 test('loadIgnore: mematuhi .gitignore + baseline', () => {
@@ -247,4 +292,30 @@ test('executeTool: find_files menemukan berdasarkan pola', async () => {
   const res = await executeTool('find_files', { pattern: '*.ts', path: sub });
   assert.ok(res.includes('a.ts'));
   assert.ok(!res.includes('b.js'));
+});
+
+test('executeTool: list_dir membatasi direktori besar', async () => {
+  const sub = path.join(TMP, 'many-entries');
+  fs.mkdirSync(sub, { recursive: true });
+  for (let i = 0; i < 505; i++) {
+    fs.writeFileSync(path.join(sub, `file-${String(i).padStart(3, '0')}.txt`), '', 'utf8');
+  }
+  const res = await executeTool('list_dir', { path: sub });
+  assert.ok(res.includes('FILE   file-000.txt'));
+  assert.ok(res.includes('FILE   file-499.txt'));
+  assert.ok(!res.includes('FILE   file-500.txt'));
+  assert.ok(res.includes('5 more entries not shown'));
+});
+
+test('executeTool: grep_search menampilkan path relatif cwd', async () => {
+  setMode('auto');
+  await executeTool('run_command', { command: `cd ${process.cwd()}` });
+  setMode('default');
+  const sub = path.join(TMP, 'grep');
+  fs.mkdirSync(sub, { recursive: true });
+  const file = path.join(sub, 'needle.txt');
+  fs.writeFileSync(file, 'alpha\nneedle here\nomega', 'utf8');
+  const res = await executeTool('grep_search', { query: 'needle', path: sub });
+  assert.ok(res.includes('.aina-test-tmp/grep/needle.txt:2:'));
+  assert.ok(!res.includes(`${process.cwd()}/.aina-test-tmp/grep/needle.txt`));
 });
