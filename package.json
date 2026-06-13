@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "aina": "./bin/aina.js"
+    "aina": "bin/aina.js"
   },
   "files": [
     "dist",
