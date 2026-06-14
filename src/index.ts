@@ -1,4 +1,5 @@
 import readline from 'node:readline/promises';
+import { emitKeypressEvents } from 'node:readline';
 import { stdin as input, stdout as output } from 'node:process';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -6,10 +7,24 @@ import { fileURLToPath } from 'node:url';
 import chalk from 'chalk';
 import type OpenAI from 'openai';
 import os from 'node:os';
-import { loadConfig, saveConfig, getPrettyModelName, isKnownModel, KNOWN_MODELS } from './config.js';
+import {
+  loadConfig,
+  saveConfig,
+  getPrettyModelName,
+  createPresetProvider,
+  getEffectiveConfig,
+  getActiveProvider,
+  getProviderModelLabel,
+  MAX_MODEL_MENU_ITEMS,
+  getDefaultModelForProvider,
+  saveActiveModel,
+  upsertProvider,
+  type ProviderConfig,
+  type ProviderKind,
+} from './config.js';
 import { getOpenAIClient } from './openai.js';
 import { AinaAgent, formatTokens } from './agent.js';
-import { askCustomPrompt, askInteractiveChoice, renderUserEcho } from './prompt.js';
+import { askCustomPrompt, askInteractiveChoice, askModelTreeChoice, askProviderModelChoice, renderUserEcho } from './prompt.js';
 import { setAutoApprove, isAutoApprove, undoLast, runValidation, resolveValidateCommand, isGitRepo, runGit } from './tools.js';
 import { setMode, isPlanMode, getModeLabel } from './mode.js';
 import { loadProjectContext } from './context.js';
@@ -39,26 +54,27 @@ Usage:
   aina --resume <uuid>     Resume a previous session by its id
 
 Options:
-  -m, --model <model>      Choose a model (aina-1-flash | mini | pro | ultra)
+  -m, --model <model>      Choose a model for the active provider
   -y, --yes                Auto-approve mode (skip tool confirmations)
   -r, --resume <uuid>      Resume a saved session by its id
   -v, --version            Show version
   -h, --help               Show this help
 
 Configuration (env or ~/.ainacode/config.json):
-  AINA_API_KEY             Tiarina API key
+  AINA_PROVIDER            Provider id (tiarina | openai | openrouter | custom id)
+  AINA_API_KEY             Provider API key
   AINA_MODEL               Default model
-  AINA_BASE_URL            Gateway base URL (default https://api.tiarina.id/v1)
+  AINA_BASE_URL            Base URL for custom OpenAI-compatible providers
 
 Inside the REPL:
-  /help /model /init /undo /check /diff /commit /resume /clear /auto /plan /exit   Slash commands
+  /help /provider /model /init /undo /check /diff /commit /resume /clear /auto /plan /exit   Slash commands
   Tab                               Switch mode (Default → Plan → Auto)
   @<file>                           Attach a file's contents to your message
   !<command>                        Run a bash command directly`);
 }
 
-// Kartu sambutan saat belum login (API key belum ada). Dibuat agar konsisten
-// dengan banner utama: logo AINA + box cyan, tanpa emoji.
+// Kartu setup pertama. Dibuat agar konsisten dengan banner utama: logo AINA +
+// box cyan, tanpa emoji.
 function printLoginScreen(): void {
   const cols = process.stdout.columns || 80;
   const W = Math.max(40, Math.min(cols, 58));
@@ -89,10 +105,10 @@ function printLoginScreen(): void {
     blank,
     sep,
     blank,
-    row('You are not signed in', chalk.yellow('You are not signed in')),
-    row('Tiarina API Key is not configured.', chalk.gray('Tiarina API Key is not configured.')),
+    row('Welcome to AINA Code', chalk.yellow('Welcome to AINA Code')),
+    row('Choose a provider to start.', chalk.gray('Choose a provider to start.')),
     blank,
-    row('Paste your API Key below to begin.', chalk.gray('Paste your API Key below to begin.')),
+    row('You can change it later with /provider.', chalk.gray('You can change it later with /provider.')),
     row('It will be saved to ~/.ainacode/config.json', chalk.gray('It will be saved to ~/.ainacode/config.json')),
     blank,
     row('Press Ctrl+C to exit', chalk.dim('Press Ctrl+C to exit')),
@@ -103,50 +119,344 @@ function printLoginScreen(): void {
   console.log(lines.join('\n'));
 }
 
-async function checkApiKey(): Promise<string> {
-  const config = loadConfig();
-  if (config.apiKey) {
-    return config.apiKey;
-  }
-
-  // Non-interactive (mis. dipipe / mode query tanpa TTY): tidak bisa menanyakan
-  // key — langsung gagal cepat dengan instruksi jelas, jangan pakai dummy-key.
+async function askLine(question: string): Promise<string | null> {
   if (!input.isTTY) {
-    exitNoApiKey();
+    const rl = readline.createInterface({ input, output });
+    try {
+      return (await rl.question(chalk.cyan(question))).trim();
+    } finally {
+      rl.close();
+    }
   }
 
-  printLoginScreen();
-
-  const rl = readline.createInterface({ input, output });
-  // Ctrl+C on the login screen = clean exit (not an error).
-  rl.on('SIGINT', () => {
-    rl.close();
-    console.log(chalk.cyan('\nCancelled. Goodbye!\n'));
-    process.exit(0);
+  return new Promise<string | null>((resolve) => {
+    const wasRaw = input.isRaw;
+    input.setRawMode(true);
+    input.resume();
+    emitKeypressEvents(input);
+    let value = '';
+    process.stdout.write(chalk.cyan(question));
+    const onKeypress = (str: string, key: any) => {
+      if (key?.ctrl && key.name === 'c') {
+        cleanup();
+        console.log(chalk.cyan('\nCancelled. Goodbye!\n'));
+        process.exit(0);
+      }
+      if (key?.name === 'escape') {
+        cleanup();
+        process.stdout.write('\n');
+        resolve(null);
+        return;
+      }
+      if (key?.name === 'return') {
+        cleanup();
+        process.stdout.write('\n');
+        resolve(value.trim());
+        return;
+      }
+      if (key?.name === 'backspace') {
+        if (value.length > 0) {
+          value = value.slice(0, -1);
+          process.stdout.write('\b \b');
+        }
+        return;
+      }
+      if (str && str.length === 1 && str >= ' ' && !key?.ctrl && !key?.meta) {
+        value += str;
+        process.stdout.write(str);
+      }
+    };
+    function cleanup() {
+      input.removeListener('keypress', onKeypress);
+      input.setRawMode(wasRaw);
+    }
+    input.on('keypress', onKeypress);
   });
-  try {
-    const key = await rl.question(chalk.cyan('  › Tiarina API Key: '));
-    const cleanedKey = key.trim();
-    if (!cleanedKey) {
-      console.log(chalk.red('\nAPI Key cannot be empty.'));
-      exitNoApiKey();
+}
+
+async function askSecret(question: string): Promise<string | null> {
+  if (!input.isTTY) return askLine(question);
+  return new Promise<string | null>((resolve) => {
+    const wasRaw = input.isRaw;
+    input.setRawMode(true);
+    input.resume();
+    emitKeypressEvents(input);
+    let value = '';
+    process.stdout.write(chalk.cyan(question));
+    const onKeypress = (str: string, key: any) => {
+      if (key?.ctrl && key.name === 'c') {
+        cleanup();
+        console.log(chalk.cyan('\nCancelled. Goodbye!\n'));
+        process.exit(0);
+      }
+      if (key?.name === 'escape') {
+        cleanup();
+        process.stdout.write('\n');
+        resolve(null);
+        return;
+      }
+      if (key?.name === 'return') {
+        cleanup();
+        process.stdout.write('\n');
+        resolve(value.trim());
+        return;
+      }
+      if (key?.name === 'backspace') {
+        value = value.slice(0, -1);
+        return;
+      }
+      if (str && str.length === 1 && str >= ' ' && !key?.ctrl && !key?.meta) value += str;
+    };
+    function cleanup() {
+      input.removeListener('keypress', onKeypress);
+      input.setRawMode(wasRaw);
     }
-    saveConfig({ apiKey: cleanedKey });
-    console.log(chalk.green('\nSigned in successfully. API Key saved to ~/.ainacode/config.json\n'));
-    return cleanedKey;
-  } catch (e: any) {
-    // Ctrl+C / abort = clean exit without a scary error message.
-    if (/abort|sigint|ctrl/i.test(e?.message || '')) {
-      console.log(chalk.cyan('\nCancelled. Goodbye!\n'));
-      process.exit(0);
+    input.on('keypress', onKeypress);
+  });
+}
+
+function providerFromChoice(choice: string): ProviderKind {
+  if (choice.startsWith('OpenAI Compatible')) return 'custom';
+  if (choice.startsWith('OpenAI')) return 'openai';
+  if (choice.startsWith('OpenRouter')) return 'openrouter';
+  return 'tiarina';
+}
+
+function providerMenuLabel(provider: ProviderConfig, activeProviderId?: string): string {
+  const parts = [provider.name];
+  if (provider.kind === 'tiarina') parts[0] = 'Tiarina API (Recommended)';
+  parts.push(provider.apiKey ? 'configured ✓' : 'not configured');
+  if (provider.id === activeProviderId) parts.push('active');
+  return parts.join(' · ');
+}
+
+function buildProviderMenuOptions(): string[] {
+  const config = loadConfig();
+  const byId = new Map(config.providers.map((provider) => [provider.id, provider]));
+  const presetProviders = [
+    byId.get('tiarina') || createPresetProvider('tiarina'),
+    byId.get('openai') || createPresetProvider('openai'),
+    byId.get('openrouter') || createPresetProvider('openrouter'),
+  ];
+  const customProviders = config.providers.filter((provider) => provider.kind === 'custom');
+  return [
+    ...presetProviders.map((provider) => providerMenuLabel(provider, config.activeProviderId)),
+    ...customProviders.map((provider) => providerMenuLabel(provider, config.activeProviderId)),
+    'Add OpenAI Compatible',
+  ];
+}
+
+function providerFromMenuChoice(choice: string): ProviderConfig | null {
+  const config = loadConfig();
+  if (choice.startsWith('Tiarina API')) return config.providers.find((p) => p.id === 'tiarina') || createPresetProvider('tiarina');
+  if (choice.startsWith('OpenAI ·')) return config.providers.find((p) => p.id === 'openai') || createPresetProvider('openai');
+  if (choice.startsWith('OpenRouter')) return config.providers.find((p) => p.id === 'openrouter') || createPresetProvider('openrouter');
+  return config.providers.find((provider) => choice.startsWith(provider.name)) || null;
+}
+
+function removeProvider(providerId: string): void {
+  const config = loadConfig();
+  const providers = config.providers.filter((provider) => provider.id !== providerId);
+  const activeProviderId = config.activeProviderId === providerId ? undefined : config.activeProviderId;
+  const activeModel = config.activeProviderId === providerId ? undefined : config.activeModel;
+  saveConfig({ ...config, providers, activeProviderId, activeModel });
+}
+
+async function configureProvider(kind: ProviderKind): Promise<ProviderConfig | null> {
+  if (kind === 'custom') {
+    const name = await askLine('  › Provider name: ');
+    if (name === null) return null;
+    const baseUrl = await askLine('  › Base URL: ');
+    if (baseUrl === null) return null;
+    const apiKey = await askSecret('  › API key: ');
+    if (apiKey === null) return null;
+    if (!name || !baseUrl || !apiKey) {
+      console.log(chalk.red('\nProvider name, URL, and API key are required.'));
+      return null;
     }
-    console.error(chalk.red(`Failed to read API Key: ${e?.message || e}`));
-    exitNoApiKey();
-  } finally {
-    rl.close();
+    return {
+      id: `custom-${Date.now()}`,
+      name,
+      kind: 'custom',
+      baseUrl,
+      apiKey,
+      modelsCache: [],
+    };
   }
-  // Unreachable: exitNoApiKey() memanggil process.exit, tapi membantu type-checker.
-  return '';
+
+  const provider = createPresetProvider(kind);
+  const apiKey = await askSecret(`  › ${provider.name} API key: `);
+  if (apiKey === null) return null;
+  if (!apiKey) {
+    console.log(chalk.red('\nAPI key cannot be empty.'));
+    return null;
+  }
+  return { ...provider, apiKey };
+}
+
+type ProviderValidationResult =
+  | { ok: true; provider: ProviderConfig }
+  | { ok: false; message: string };
+
+async function refreshProviderModels(provider: ProviderConfig): Promise<ProviderValidationResult> {
+  try {
+    const client = getOpenAIClient(provider.apiKey, provider.baseUrl);
+    const list = await client.models.list();
+    const models = list.data.map((m: any) => String(m.id)).filter(Boolean);
+    if (models.length > 0) {
+      return { ok: true, provider: { ...provider, modelsCache: models, modelsFetchedAt: new Date().toISOString() } };
+    }
+    return { ok: false, message: 'Model list is empty.' };
+  } catch (e: any) {
+    return { ok: false, message: e?.message || String(e) };
+  }
+}
+
+async function saveValidatedProvider(provider: ProviderConfig, activate: boolean): Promise<ProviderConfig | null> {
+  const result = await refreshProviderModels(provider);
+  if (!result.ok) {
+    console.log(chalk.yellow(`Could not fetch models from ${provider.name}.`));
+    console.log(chalk.gray(`Reason: ${result.message}`));
+    console.log(chalk.gray('Provider was not saved.'));
+    return null;
+  }
+  upsertProvider(result.provider, activate);
+  return result.provider;
+}
+
+async function activateProvider(provider: ProviderConfig, agent: AinaAgent): Promise<OpenAI> {
+  const model = getDefaultModelForProvider(provider);
+  saveActiveModel(model, provider.id);
+  const nextClient = getOpenAIClient(provider.apiKey, provider.baseUrl);
+  agent.changeClient(nextClient);
+  agent.changeModel(model);
+  return nextClient;
+}
+
+async function manageConfiguredProvider(provider: ProviderConfig, agent: AinaAgent): Promise<OpenAI | null> {
+  const actions = ['Use provider', 'Refresh model list', provider.kind === 'custom' ? 'Update connection' : 'Update API key'];
+  if (provider.kind === 'custom') actions.push('Remove provider');
+  actions.push('Back');
+  const action = await askInteractiveChoice(provider.name, actions);
+  if (!action || action === 'Back') return null;
+
+  if (action === 'Use provider') {
+    const nextClient = await activateProvider(provider, agent);
+    console.clear();
+    printWelcomeBanner(agent.getModel());
+    console.log(chalk.green(`Provider changed to: ${getProviderModelLabel(provider, agent.getModel())}`));
+    console.log(chalk.gray('Use /model to choose a different model.'));
+    return nextClient;
+  }
+
+  if (action === 'Refresh model list') {
+    const result = await refreshProviderModels(provider);
+    if (!result.ok) {
+      console.log(chalk.yellow(`Could not refresh ${provider.name}.`));
+      console.log(chalk.gray(`Reason: ${result.message}`));
+      console.log(chalk.gray('Existing provider settings were kept.'));
+      return null;
+    }
+    upsertProvider(result.provider, provider.id === loadConfig().activeProviderId);
+    console.log(chalk.green(`Model list refreshed for ${provider.name}.`));
+    return null;
+  }
+
+  if (action === 'Update API key' || action === 'Update connection') {
+    let updated: ProviderConfig | null;
+    if (provider.kind === 'custom') {
+      const name = await askLine(`  › Provider name (${provider.name}): `);
+      if (name === null) return null;
+      const baseUrl = await askLine(`  › Base URL (${provider.baseUrl}): `);
+      if (baseUrl === null) return null;
+      const apiKey = await askSecret('  › API key: ');
+      if (apiKey === null) return null;
+      updated = { ...provider, name: name || provider.name, baseUrl: baseUrl || provider.baseUrl, apiKey: apiKey || provider.apiKey };
+    } else {
+      const apiKey = await askSecret(`  › ${provider.name} API key: `);
+      if (apiKey === null) return null;
+      if (!apiKey) {
+        console.log(chalk.yellow('API key unchanged.'));
+        return null;
+      }
+      updated = { ...provider, apiKey };
+    }
+    const saved = await saveValidatedProvider(updated, provider.id === loadConfig().activeProviderId);
+    if (saved) console.log(chalk.green(`${saved.name} updated.`));
+    return null;
+  }
+
+  if (action === 'Remove provider') {
+    if (provider.id === loadConfig().activeProviderId) {
+      console.log(chalk.yellow('Cannot remove the active provider. Switch to another provider first.'));
+      return null;
+    }
+    removeProvider(provider.id);
+    console.log(chalk.green(`${provider.name} removed.`));
+  }
+  return null;
+}
+
+async function pickModel(provider: ProviderConfig): Promise<string> {
+  const choice = await askProviderModelChoice(provider, MAX_MODEL_MENU_ITEMS);
+  if (choice.type === 'cancel') return '';
+  if (choice.type === 'custom') return (await askLine('  › Model ID: ')) || '';
+  return choice.model;
+}
+
+async function pickModelFromTree(): Promise<{ provider: ProviderConfig; model: string } | null> {
+  const config = loadConfig();
+  const providers = config.providers.filter((provider) => provider.apiKey && provider.modelsCache?.length);
+  if (providers.length === 0) {
+    console.log(chalk.yellow('No configured providers with cached models. Use /provider to add or refresh a provider.'));
+    return null;
+  }
+  const choice = await askModelTreeChoice(providers);
+  if (choice.type === 'cancel') return null;
+  if (choice.type === 'model') return { provider: choice.provider, model: choice.model };
+  const model = await pickModel(choice.provider);
+  return model ? { provider: choice.provider, model } : null;
+}
+
+async function runFirstSetup(): Promise<void> {
+  if (!input.isTTY) exitNoApiKey();
+  printLoginScreen();
+  while (true) {
+    const choice = await askInteractiveChoice('Choose a provider', [
+      'Tiarina API (Recommended)',
+      'OpenAI',
+      'OpenRouter',
+      'OpenAI Compatible',
+    ]);
+    if (!choice) process.exit(0);
+    const configured = await configureProvider(providerFromChoice(choice));
+    if (!configured) {
+      console.log(chalk.gray('Cancelled.'));
+      continue;
+    }
+    const result = await refreshProviderModels(configured);
+    if (!result.ok) {
+      console.log(chalk.yellow(`Could not fetch models from ${configured.name}.`));
+      console.log(chalk.gray(`Reason: ${result.message}`));
+      console.log(chalk.gray('Provider was not saved.'));
+      continue;
+    }
+    upsertProvider(result.provider, true);
+    const model = getDefaultModelForProvider(result.provider);
+    saveActiveModel(model, result.provider.id);
+    console.log(chalk.green(`\nProvider ready: ${getProviderModelLabel(result.provider, model)}`));
+    return;
+  }
+}
+
+async function ensureConfigured(): Promise<NonNullable<ReturnType<typeof getEffectiveConfig>>> {
+  let effective = getEffectiveConfig();
+  if (effective) return effective;
+
+  await runFirstSetup();
+  effective = getEffectiveConfig();
+  if (!effective) exitNoApiKey();
+  return effective;
 }
 
 // Cetak instruksi konfigurasi key lalu keluar dengan kode error. Dipanggil saat
@@ -176,13 +486,14 @@ function exitNoApiKey(): never {
     blank,
     centerRow('AINA Code', chalk.bold.white),
     blank,
-    centerRow('Tiarina API Key is not configured.', chalk.yellow),
+    centerRow('No provider is configured.', chalk.yellow),
     blank,
-    leftRow('Set one of these, then run again:', chalk.gray),
+    leftRow('Run `aina` interactively to set up a provider,', chalk.gray),
+    leftRow('or set env vars for one-shot usage:', chalk.gray),
     blank,
-    leftRow('env :  export AINA_API_KEY="<your-key>"', chalk.gray),
-    leftRow('file:  ~/.ainacode/config.json', chalk.gray),
-    leftRow('       { "apiKey": "<your-key>" }', chalk.dim),
+    leftRow('AINA_PROVIDER=tiarina', chalk.gray),
+    leftRow('AINA_API_KEY=<your-key>', chalk.gray),
+    leftRow('AINA_MODEL=aina-1-flash', chalk.gray),
     blank,
     bottom,
     '',
@@ -221,8 +532,10 @@ function getPrettyCwd(): string {
 
 function printWelcomeBanner(model: string) {
   const prettyCwd = getPrettyCwd();
+  const providerName = getActiveProvider(loadConfig())?.name;
   const prettyModel = getPrettyModelName(model);
-  const headerModel = model.toLowerCase() === prettyModel.toLowerCase() ? model : prettyModel;
+  const displayModel = model.toLowerCase() === prettyModel.toLowerCase() ? model : prettyModel;
+  const headerModel = providerName ? `${providerName} · ${displayModel}` : displayModel;
 
   const cols = process.stdout.columns || 80;
   const total = Math.min(cols, 96);
@@ -350,6 +663,7 @@ async function runTurn(agent: AinaAgent, input: string): Promise<string[]> {
 
 async function runInteractive(agent: AinaAgent, client: OpenAI, resume?: SavedSession) {
   printWelcomeBanner(agent.getModel());
+  let activeClient = client;
 
   // Identity for the current session. A resumed session keeps its id/title so
   // that subsequent saves continue the same file; a fresh session gets a new id
@@ -378,7 +692,7 @@ async function runInteractive(agent: AinaAgent, client: OpenAI, resume?: SavedSe
       if (firstText.trim()) {
         sessionTitle = fallbackTitle(firstText);
         titleRequested = true;
-        generateSessionTitle(client, agent.getModel(), firstText)
+        generateSessionTitle(activeClient, agent.getModel(), firstText)
           .then((t) => {
             sessionTitle = t;
             saveSession({
@@ -473,29 +787,58 @@ Write it in the user's language. If AINA.md already exists, update its contents.
           continue;
         } else if (cmd === '/model') {
           if (!arg) {
-            console.log(chalk.cyan(`Current model: ${agent.getModel()}`));
-            try {
-              const list = await client.models.list();
-              const ids = list.data.map((m: any) => m.id);
-              console.log(chalk.gray(`Available models: ${ids.join(', ')}`));
-            } catch {
-              console.log(chalk.gray('Available models: aina-1-flash, aina-1-mini, aina-1-pro, aina-1-ultra'));
-            }
+            const picked = await pickModelFromTree();
+            if (!picked) continue;
+            activeClient = getOpenAIClient(picked.provider.apiKey, picked.provider.baseUrl);
+            agent.changeClient(activeClient);
+            agent.changeModel(picked.model);
+            saveActiveModel(picked.model, picked.provider.id);
+            console.clear();
+            printWelcomeBanner(agent.getModel());
+            console.log(chalk.green(`Model changed to: ${getProviderModelLabel(picked.provider, picked.model)}`));
           } else {
-            if (!isKnownModel(arg)) {
-              console.log(chalk.yellow(`Model "${arg}" is not recognized. Supported models: ${KNOWN_MODELS.join(', ')}.`));
-              const ok = await askInteractiveChoice(`Use "${arg}" anyway?`, ['Yes, use it', 'Cancel']);
-              if (ok !== 'Yes, use it') {
-                console.log(chalk.gray('Cancelled. Model unchanged.'));
-                continue;
-              }
-            }
             agent.changeModel(arg);
-            saveConfig({ model: arg });
+            saveActiveModel(arg);
             console.clear();
             printWelcomeBanner(agent.getModel());
             console.log(chalk.green(`Model changed to: ${arg}`));
           }
+          continue;
+        } else if (cmd === '/provider') {
+          const options = buildProviderMenuOptions();
+          const choice = arg ? options.find((o) => o.toLowerCase().includes(arg.toLowerCase())) || arg : await askInteractiveChoice('Choose a provider', options);
+          if (!choice) continue;
+
+          if (choice === 'Add OpenAI Compatible') {
+            const configured = await configureProvider('custom');
+            if (!configured) {
+              console.log(chalk.gray('Cancelled.'));
+              continue;
+            }
+            const saved = await saveValidatedProvider(configured, false);
+            if (saved) console.log(chalk.green(`Provider saved: ${saved.name}. It was not activated.`));
+            continue;
+          }
+
+          const selectedProvider = providerFromMenuChoice(choice);
+          if (!selectedProvider) {
+            console.log(chalk.yellow(`Unknown provider: ${choice}`));
+            continue;
+          }
+
+          if (selectedProvider.apiKey) {
+            const nextClient = await manageConfiguredProvider(selectedProvider, agent);
+            if (nextClient) activeClient = nextClient;
+            continue;
+          }
+
+          const configured = await configureProvider(selectedProvider.kind);
+          if (!configured) {
+            console.log(chalk.gray('Cancelled.'));
+            continue;
+          }
+          const saved = await saveValidatedProvider(configured, false);
+          if (saved) console.log(chalk.green(`Provider saved: ${saved.name}. It was not activated.`));
           continue;
         } else if (cmd === '/auto') {
           setAutoApprove(!isAutoApprove());
@@ -623,14 +966,16 @@ Write it in the user's language. If AINA.md already exists, update its contents.
           continue;
         } else if (cmd === '/config') {
           const cfg = loadConfig();
+          const provider = getActiveProvider(cfg);
           if (!arg) {
             console.log(chalk.bold.yellow('Configuration (~/.ainacode/config.json):'));
-            console.log(`  ${chalk.gray('model')}          : ${cfg.model}`);
-            console.log(`  ${chalk.gray('baseUrl')}        : ${cfg.baseUrl}`);
-            console.log(`  ${chalk.gray('apiKey')}         : ${cfg.apiKey ? 'configured ✓' : chalk.red('not set')}`);
+            console.log(`  ${chalk.gray('provider')}       : ${provider ? provider.name : chalk.red('not set')}`);
+            console.log(`  ${chalk.gray('model')}          : ${cfg.activeModel || chalk.gray('not set')}`);
+            console.log(`  ${chalk.gray('baseUrl')}        : ${provider?.baseUrl || chalk.gray('not set')}`);
+            console.log(`  ${chalk.gray('apiKey')}         : ${provider?.apiKey ? 'configured ✓' : chalk.red('not set')}`);
             console.log(`  ${chalk.gray('autoValidate')}   : ${cfg.autoValidate}`);
             console.log(`  ${chalk.gray('validateCommand')}: ${cfg.validateCommand || chalk.gray('(auto-detect)')}`);
-            console.log(chalk.gray('  Change with: /config <key> <value>  (keys: model, baseUrl, apiKey, autoValidate, validateCommand)'));
+            console.log(chalk.gray('  Change providers with /provider and models with /model.'));
             continue;
           }
           const cparts = arg.split(' ');
@@ -642,14 +987,8 @@ Write it in the user's language. If AINA.md already exists, update its contents.
           }
           if (key === 'model') {
             agent.changeModel(value);
-            saveConfig({ model: value });
+            saveActiveModel(value);
             console.log(chalk.green(`model = ${value}`));
-          } else if (key === 'baseUrl') {
-            saveConfig({ baseUrl: value });
-            console.log(chalk.green(`baseUrl = ${value}`) + chalk.gray(' (restart aina to apply)'));
-          } else if (key === 'apiKey') {
-            saveConfig({ apiKey: value });
-            console.log(chalk.green('apiKey updated') + chalk.gray(' (restart aina to apply)'));
           } else if (key === 'autoValidate') {
             const on = value === 'true' || value === 'on' || value === '1';
             saveConfig({ autoValidate: on });
@@ -658,7 +997,7 @@ Write it in the user's language. If AINA.md already exists, update its contents.
             saveConfig({ validateCommand: value || undefined });
             console.log(chalk.green(`validateCommand = ${value || '(auto-detect)'}`));
           } else {
-            console.log(chalk.yellow(`Unknown key "${key}". Keys: model, baseUrl, apiKey, autoValidate, validateCommand.`));
+            console.log(chalk.yellow(`Unknown key "${key}". Keys: model, autoValidate, validateCommand. Use /provider for API keys and URLs.`));
           }
           continue;
         } else if (cmd === '/status') {
@@ -669,10 +1008,11 @@ Write it in the user's language. If AINA.md already exists, update its contents.
           console.log(chalk.bold.yellow('Status:'));
           console.log(`  ${chalk.gray('Version')}     : ${getVersion()}`);
           console.log(`  ${chalk.gray('Model')}       : ${getPrettyModelName(agent.getModel())} (${agent.getModel()})`);
+          console.log(`  ${chalk.gray('Provider')}    : ${getActiveProvider(cfg)?.name || chalk.red('not set')}`);
           console.log(`  ${chalk.gray('Mode')}        : ${getModeLabel()}${isAutoApprove() ? ' · auto-approve' : ''}`);
           console.log(`  ${chalk.gray('Directory')}   : ${process.cwd()}`);
-          console.log(`  ${chalk.gray('Gateway')}     : ${cfg.baseUrl}`);
-          console.log(`  ${chalk.gray('API key')}     : ${cfg.apiKey ? 'configured ✓' : chalk.red('not set')}`);
+          console.log(`  ${chalk.gray('Gateway')}     : ${getActiveProvider(cfg)?.baseUrl || chalk.gray('not set')}`);
+          console.log(`  ${chalk.gray('API key')}     : ${getActiveProvider(cfg)?.apiKey ? 'configured ✓' : chalk.red('not set')}`);
           console.log(`  ${chalk.gray('Session')}     : ${sessionTitle || 'Untitled'} (${sessionId.slice(0, 8)})`);
           console.log(`  ${chalk.gray('Project ctx')} : ${ctx ? ctx.fileName : chalk.gray('none')}`);
           console.log(`  ${chalk.gray('Turns')}       : ${u.turns}`);
@@ -683,6 +1023,7 @@ Write it in the user's language. If AINA.md already exists, update its contents.
         } else if (cmd === '/help') {
           console.log(chalk.bold.yellow('Interactive Commands:'));
           console.log(`  ${chalk.cyan('/model [model_name]')} : Show the active model or switch models`);
+          console.log(`  ${chalk.cyan('/provider')}           : Manage OpenAI-compatible providers`);
           console.log(`  ${chalk.cyan('/init')}               : Auto-create/update AINA.md (project context)`);
           console.log(`  ${chalk.cyan('/undo')}               : Undo the last file change (write/edit/delete/move)`);
           console.log(`  ${chalk.cyan('/check')}              : Run validation (typecheck/lint) now`);
@@ -692,7 +1033,7 @@ Write it in the user's language. If AINA.md already exists, update its contents.
           console.log(`  ${chalk.cyan('/compact')}            : Summarize & shrink the conversation context`);
           console.log(`  ${chalk.cyan('/usage')}              : Show session token usage & context size`);
           console.log(`  ${chalk.cyan('/status')}             : Show model, mode, directory, session & usage`);
-          console.log(`  ${chalk.cyan('/config [key value]')} : Show config, or set model/baseUrl/apiKey/autoValidate/validateCommand`);
+          console.log(`  ${chalk.cyan('/config [key value]')} : Show config, or set model/autoValidate/validateCommand`);
           console.log(`  ${chalk.cyan('/clear')}              : Reset conversation history and clear the screen`);
           console.log(`  ${chalk.cyan('/auto')}               : Toggle auto-approve mode (skip confirmations)`);
           console.log(`  ${chalk.cyan('/plan')}               : Toggle plan mode (read-only, plan only)`);
@@ -745,11 +1086,11 @@ async function main() {
     process.exit(0);
   }
 
-  const apiKey = await checkApiKey();
+  const effective = await ensureConfigured();
   const config = loadConfig();
   
   const args = process.argv.slice(2);
-  let model = config.model;
+  let model = effective.model;
   let modelExplicit = false;
   let resumeId: string | undefined;
   const queryArgs: string[] = [];
@@ -783,7 +1124,7 @@ async function main() {
     }
   }
 
-  const client = getOpenAIClient(apiKey, config.baseUrl);
+  const client = getOpenAIClient(effective.apiKey, effective.baseUrl);
   const agent = new AinaAgent(client, model);
 
   if (resumeSession) {
@@ -794,7 +1135,7 @@ async function main() {
 
   const query = queryArgs.join(' ').trim();
   if (query) {
-    console.log(chalk.gray(`Connected to API: ${config.baseUrl}`));
+    console.log(chalk.gray(`Connected to ${effective.provider.name}: ${effective.baseUrl}`));
     console.log(chalk.gray(`Using model: ${model} (${getPrettyModelName(model)})`));
     await agent.run(query);
   } else {

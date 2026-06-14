@@ -4,7 +4,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { getPrettyModelName } from '../dist/config.js';
+import {
+  MAX_MODEL_MENU_ITEMS,
+  buildModelTreeItems,
+  getProviderModelOverviews,
+  createPresetProvider,
+  filterModelOptions,
+  getDefaultModelForProvider,
+  getProviderModelLabel,
+  getPrettyModelName,
+} from '../dist/config.js';
 import { loadProjectContext, formatProjectContext } from '../dist/context.js';
 import { globToRegExp } from '../dist/tools.js';
 import {
@@ -19,6 +28,7 @@ import {
   parseChoices,
   sanitizeActiveHistory,
   sanitizeHistoryForSave,
+  extractThoughtPreview,
 } from '../dist/agent.js';
 import { diffLines, renderDiff } from '../dist/diff.js';
 import { getMode, setMode, cycleMode, getModeLabel, footerRight } from '../dist/mode.js';
@@ -36,6 +46,134 @@ test('getPrettyModelName: maps known ids and falls back to input', () => {
   assert.equal(getPrettyModelName('aina-1-pro'), 'Aina 1 Pro');
   assert.equal(getPrettyModelName('AINA-1-FLASH'), 'Aina 1 Flash');
   assert.equal(getPrettyModelName('something-else'), 'something-else');
+});
+
+test('provider presets: Tiarina recommended defaults and provider model label', () => {
+  const provider = createPresetProvider('tiarina', 'test-key');
+  assert.equal(provider.name, 'Tiarina API');
+  assert.equal(provider.baseUrl, 'https://api.tiarina.id/v1');
+  assert.equal(provider.defaultModel, 'aina-1-flash');
+  assert.deepEqual(provider.modelsCache, ['aina-1-flash', 'aina-1-mini']);
+  assert.equal(getProviderModelLabel(provider, 'aina-1-flash'), 'Tiarina API - Aina 1 Flash');
+});
+
+test('provider presets: OpenAI and OpenRouter need only API keys', () => {
+  const openai = createPresetProvider('openai', 'openai-key');
+  const openrouter = createPresetProvider('openrouter', 'openrouter-key');
+  assert.equal(openai.baseUrl, 'https://api.openai.com/v1');
+  assert.equal(openai.apiKey, 'openai-key');
+  assert.equal(openrouter.baseUrl, 'https://openrouter.ai/api/v1');
+  assert.equal(openrouter.apiKey, 'openrouter-key');
+});
+
+test('filterModelOptions: empty query shows curated OpenRouter list only', () => {
+  const provider = createPresetProvider('openrouter', 'key');
+  provider.modelsCache = Array.from({ length: 50 }, (_, i) => `provider/model-${i}`);
+  const options = filterModelOptions(provider);
+  assert.ok(options.length <= MAX_MODEL_MENU_ITEMS);
+  assert.equal(options[0].id, 'openai/gpt-5.5');
+});
+
+test('filterModelOptions: query searches cache and limits results', () => {
+  const provider = createPresetProvider('openrouter', 'key');
+  provider.modelsCache = [
+    ...Array.from({ length: 20 }, (_, i) => `openai/gpt-test-${i}`),
+    'anthropic/claude-sonnet-4.5',
+  ];
+  const options = filterModelOptions(provider, 'gpt');
+  assert.equal(options.length, MAX_MODEL_MENU_ITEMS);
+  assert.ok(options.every((option) => option.id.includes('gpt')));
+});
+
+test('getDefaultModelForProvider: uses provider defaults and cache fallback', () => {
+  const tiarina = createPresetProvider('tiarina', 'key');
+  const openrouter = createPresetProvider('openrouter', 'key');
+  const custom = {
+    id: 'custom-test',
+    name: 'Custom Test',
+    kind: 'custom',
+    baseUrl: 'https://example.test/v1',
+    apiKey: 'key',
+    defaultModel: 'custom/default',
+    modelsCache: ['custom/other'],
+  };
+  const cacheOnly = {
+    id: 'cache-only',
+    name: 'Cache Only',
+    kind: 'custom',
+    baseUrl: 'https://example.test/v1',
+    apiKey: 'key',
+    modelsCache: ['cache/first', 'cache/second'],
+  };
+  assert.equal(getDefaultModelForProvider(tiarina), 'aina-1-flash');
+  assert.equal(getDefaultModelForProvider(openrouter), 'openai/gpt-5.5');
+  assert.equal(getDefaultModelForProvider(custom), 'custom/other');
+  assert.equal(getDefaultModelForProvider(cacheOnly), 'cache/first');
+});
+
+test('getProviderModelOverviews: limits providers and models with hidden counts', () => {
+  const providers = Array.from({ length: 6 }, (_, i) => ({
+    id: i === 0 ? 'tiarina' : `custom-${i}`,
+    name: i === 0 ? 'Tiarina API' : `Custom ${i}`,
+    kind: i === 0 ? 'tiarina' : 'custom',
+    baseUrl: 'https://example.test/v1',
+    apiKey: 'key',
+    modelsCache: Array.from({ length: 6 }, (_unused, modelIndex) => `model-${i}-${modelIndex}`),
+  }));
+  const overview = getProviderModelOverviews(providers);
+  assert.equal(overview.overviews.length, 5);
+  assert.equal(overview.hiddenProviderCount, 1);
+  assert.equal(overview.overviews[0].models.length, 4);
+  assert.equal(overview.overviews[0].hiddenModelCount, 2);
+});
+
+test('model overview label shape: provider with indented model children', () => {
+  const provider = createPresetProvider('tiarina', 'key');
+  provider.modelsCache = ['aina-1-flash', 'aina-1-mini', 'aina-1-pro', 'aina-1-ultra', 'aina-2-test'];
+  const overview = getProviderModelOverviews([provider]).overviews[0];
+  assert.deepEqual(overview.models, ['aina-1-flash', 'aina-1-mini', 'aina-1-pro', 'aina-1-ultra']);
+  assert.equal(overview.hiddenModelCount, 1);
+});
+
+test('buildModelTreeItems: provider headers are non-model items with 2x3 limits', () => {
+  const providers = Array.from({ length: 3 }, (_, providerIndex) => ({
+    id: providerIndex === 0 ? 'tiarina' : `custom-${providerIndex}`,
+    name: providerIndex === 0 ? 'Tiarina API' : `Custom ${providerIndex}`,
+    kind: providerIndex === 0 ? 'tiarina' : 'custom',
+    baseUrl: 'https://example.test/v1',
+    apiKey: 'key',
+    modelsCache: Array.from({ length: 5 }, (_unused, modelIndex) => `provider-${providerIndex}-model-${modelIndex}`),
+  }));
+  const items = buildModelTreeItems(providers);
+  assert.equal(items.filter((item) => item.type === 'provider').length, 2);
+  assert.equal(items.filter((item) => item.type === 'model').length, 6);
+  assert.equal(items.filter((item) => item.type === 'more-models').length, 2);
+  assert.equal(items.at(-1).type, 'more-providers');
+});
+
+test('buildModelTreeItems: search only shows providers with matching models', () => {
+  const tiarina = createPresetProvider('tiarina', 'key');
+  tiarina.modelsCache = ['aina-1-flash'];
+  const openai = createPresetProvider('openai', 'key');
+  openai.modelsCache = ['gpt-5.5'];
+  const items = buildModelTreeItems([openai, tiarina], 'Aina');
+  assert.equal(items.filter((item) => item.type === 'provider').length, 1);
+  assert.equal(items.find((item) => item.type === 'provider').provider.id, 'tiarina');
+  assert.equal(items.find((item) => item.type === 'model').model, 'aina-1-flash');
+});
+
+test('extractThoughtPreview: strips thought tags and truncates preview', () => {
+  const input = '<thought>' + 'a '.repeat(200) + '</thought>Halo!';
+  const result = extractThoughtPreview(input);
+  assert.equal(result.visible, 'Halo!');
+  assert.ok(result.preview.length <= 241);
+  assert.ok(!result.preview.includes('<thought>'));
+});
+
+test('extractThoughtPreview: unclosed think tag does not leak raw tag', () => {
+  const result = extractThoughtPreview('Hello\n<think>internal reasoning');
+  assert.equal(result.visible, 'Hello\n');
+  assert.equal(result.preview, 'internal reasoning');
 });
 
 test('CLI non-TTY: --help dan --version tidak butuh API key', () => {
@@ -103,6 +241,20 @@ test('renderDiff: summary reports added/removed counts', () => {
   assert.ok(out.includes('Removed 1 line'));
 });
 
+test('renderDiff: add/remove use gutter signs while preserving line text', () => {
+  const out = renderDiff('Update', 'file.txt', 'old', 'new');
+  const plain = out.replace(/\x1b\[[0-9;]*m/g, '');
+  assert.ok(plain.includes(' + new'));
+  assert.ok(plain.includes(' - old'));
+});
+
+test('renderDiff: tabs are expanded in changed block rows', () => {
+  const out = renderDiff('Update', 'file.go', '\treturn 1', '\tif n <= 1 {');
+  const plain = out.replace(/\x1b\[[0-9;]*m/g, '');
+  assert.ok(plain.includes('+   if n <= 1 {'));
+  assert.ok(!plain.includes('\tif'));
+});
+
 test('loadProjectContext: memilih file prioritas pertama yang berisi', () => {
   const dir = path.join(TMP, 'ctx-priority');
   fs.mkdirSync(dir, { recursive: true });
@@ -137,6 +289,16 @@ test('mode: set, cycle, label, dan footer text', () => {
 test('renderMarkdown: output tidak kosong untuk markdown umum', () => {
   assert.ok(renderMarkdown('plain text').trim());
   assert.ok(renderMarkdown('**bold**\n- item\n```js\n1 + 1\n```').trim());
+});
+
+test('renderMarkdown: headings hide markdown markers and emoji is stripped', () => {
+  const plain = renderMarkdown('# Selamat ✨\n## Info 😊\n- 🚀 Semangat').replace(/\x1b\[[0-9;]*m/g, '');
+  assert.ok(plain.includes('Selamat'));
+  assert.ok(plain.includes('Info'));
+  assert.ok(!plain.includes('# Selamat'));
+  assert.ok(!plain.includes('✨'));
+  assert.ok(!plain.includes('😊'));
+  assert.ok(!plain.includes('🚀'));
 });
 
 test('session: save/load isolated HOME lewat child process', () => {
@@ -294,10 +456,16 @@ test('findFlushBoundary: flushes complete markdown blocks', () => {
 
 test('findFlushBoundary: fallback flushes long single paragraph at word boundary', () => {
   const text = `${'kata '.repeat(80)}akhir`;
-  const boundary = findFlushBoundary(text, false, 120);
+  const boundary = findFlushBoundary(text, false, 120, true);
   assert.ok(boundary > 0);
   assert.ok(boundary <= 120);
   assert.equal(text[boundary], ' ');
+});
+
+test('findFlushBoundary: stale non-final flush does not act like final force', () => {
+  assert.equal(findFlushBoundary('S', false, 120, true), -1);
+  assert.equal(findFlushBoundary('Saya adalah Aina', false, 120, true), -1);
+  assert.equal(findFlushBoundary('## Heading', false, 120, true), -1);
 });
 
 test('findFlushBoundary: does not flush inside open code fence', () => {

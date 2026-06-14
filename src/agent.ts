@@ -4,7 +4,7 @@ import readline from "node:readline";
 import fs from "node:fs";
 import path from "node:path";
 import { toolsList, executeTool, resetTurnApproval, runValidation } from "./tools.js";
-import { loadConfig, getPrettyModelName } from "./config.js";
+import { getActiveProvider, loadConfig, getPrettyModelName } from "./config.js";
 import { renderMarkdown } from "./markdown.js";
 import { isPlanMode, footerRight } from "./mode.js";
 import { loadProjectContext, formatProjectContext } from "./context.js";
@@ -223,7 +223,7 @@ const MAX_ATTACH_BYTES = 50 * 1024; // 50 KB cap per attached file
 const MAX_TOOL_RESULT_BYTES = 32 * 1024;
 const MAX_COMPLETION_TOKENS = 4096;
 const TOOL_RESULT_EVICT_AFTER_REQUESTS = 1;
-const STREAM_FALLBACK_FLUSH_MS = 400;
+const STREAM_FALLBACK_FLUSH_MS = 1200;
 const STREAM_FALLBACK_FLUSH_CHARS = 240;
 const VALIDATION_PREFIX = "Automatic validation (";
 const ATTACHMENTS_MARKER = "\n\nAttached files:\n";
@@ -276,6 +276,7 @@ export function findFlushBoundary(
   pending: string,
   force = false,
   minChars = STREAM_FALLBACK_FLUSH_CHARS,
+  allowSoftFlush = false,
 ): number {
   let from = 0;
   while (true) {
@@ -284,13 +285,13 @@ export function findFlushBoundary(
     if (countCodeFences(pending.slice(0, idx)) % 2 === 0) return idx;
     from = idx + 1;
   }
-  if (!force && pending.length < minChars) return -1;
+  if (!force && (!allowSoftFlush || pending.length < minChars)) return -1;
   if (countCodeFences(pending) % 2 !== 0) return -1;
 
   const newline = pending.lastIndexOf("\n");
-  if (newline > 0) return newline;
+  if ((force || allowSoftFlush) && newline > 0) return newline;
 
-  if (!force && pending.length >= minChars) {
+  if (allowSoftFlush && pending.length >= minChars) {
     const softBreak = pending.lastIndexOf(" ", minChars);
     if (softBreak > 0) return softBreak;
   }
@@ -495,7 +496,7 @@ export function friendlyError(error: any): string {
   const code = error?.code || "";
   const message = String(error?.message || "");
   if (status === 401 || status === 403) {
-    return "Error: API key is invalid or rejected. Check AINA_API_KEY or ~/.ainacode/config.json.";
+    return "Error: API key is invalid or rejected. Check your active provider with /provider or ~/.ainacode/config.json.";
   }
   if (status === 429) {
     return "Error: too many requests (rate limit). Try again shortly.";
@@ -513,6 +514,68 @@ export function friendlyError(error: any): string {
     return "Error: failed to connect to the server. Check your internet connection / AINA_BASE_URL.";
   }
   return `Execution error: ${error?.message || String(error)}`;
+}
+
+export function extractThoughtPreview(text: string, maxChars = 240, maxLines = 3): { visible: string; preview: string } {
+  const thoughts: string[] = [];
+  let visible = text.replace(/<(thought|think)\b[^>]*>([\s\S]*?)<\/\1>/gi, (_match, _tag, body) => {
+    thoughts.push(String(body || '').trim());
+    return '';
+  });
+  visible = visible.replace(/<(thought|think)\b[^>]*>[\s\S]*$/gi, (match) => {
+    thoughts.push(match.replace(/^<(thought|think)\b[^>]*>/i, '').trim());
+    return '';
+  });
+  visible = visible.replace(/^[\s\S]*?<\/(thought|think)>/i, '');
+  const rawPreview = thoughts.join('\n').replace(/\s+/g, ' ').trim();
+  if (!rawPreview) return { visible, preview: '' };
+  const limited = rawPreview.length > maxChars ? `${rawPreview.slice(0, Math.max(0, maxChars - 1)).trim()}…` : rawPreview;
+  return { visible, preview: limited.split('\n').slice(0, maxLines).join('\n') };
+}
+
+function hasUnclosedThoughtTag(text: string): boolean {
+  const open = text.search(/<(thought|think)\b[^>]*>/i);
+  if (open === -1) return false;
+  const close = text.slice(open).search(/<\/(thought|think)>/i);
+  return close === -1;
+}
+
+function formatThoughtPreview(preview: string): string {
+  const lines = preview.split("\n").filter(Boolean);
+  const body = lines.length > 0 ? lines : [preview];
+  return [
+    chalk.cyan.dim("╭─ Thinking Preview"),
+    ...body.map((line) => `${chalk.cyan.dim("│")} ${chalk.dim(line)}`),
+    chalk.cyan.dim("╰─"),
+    "",
+  ].join("\n");
+}
+
+function insetAssistantOutput(text: string): string {
+  const left = "  ";
+  const rightMargin = 3;
+  const width = Math.max(40, (process.stdout.columns || 100) - left.length - rightMargin);
+  const truncateAnsi = (line: string) => {
+    let visible = 0;
+    let out = "";
+    for (let i = 0; i < line.length && visible < width; i++) {
+      if (line[i] === "\x1b") {
+        const match = line.slice(i).match(/^\x1b\[[0-9;]*m/);
+        if (match) {
+          out += match[0];
+          i += match[0].length - 1;
+          continue;
+        }
+      }
+      out += line[i];
+      visible++;
+    }
+    return out + (visible >= width ? chalk.reset("") : "");
+  };
+  return text.split("\n").map((line) => {
+    if (!line.trim()) return "";
+    return left + truncateAnsi(line);
+  }).join("\n");
 }
 
 // Format a token count compactly: 1234 -> "1.2k".
@@ -588,8 +651,10 @@ class AinaSpinner {
     // Apply the shining sweep to the status text and append the running timer
     const animatedStatus = colorizeWave(statusText, this.tick);
     const elapsed = chalk.gray(this.elapsedText());
+    const provider = getActiveProvider(loadConfig());
     const prettyModel = getPrettyModelName(this.model);
-    const text = `${spinnerChar} ${animatedStatus} ${elapsed} ${chalk.gray("(" + prettyModel + ")")}`;
+    const providerModel = provider ? `${provider.name} · ${prettyModel}` : prettyModel;
+    const text = `${spinnerChar} ${animatedStatus} ${elapsed} ${chalk.gray("(" + providerModel + ")")}`;
 
     this.clear();
 
@@ -597,7 +662,7 @@ class AinaSpinner {
     const leftText = isTyping
       ? "enter to queue · esc to interrupt"
       : "type to queue a message · esc to interrupt";
-    const right = footerRight(prettyModel);
+    const right = footerRight(providerModel);
     const padding = Math.max(0, cols - leftText.length - right.raw.length);
     const footer = chalk.gray(leftText) + " ".repeat(padding) + right.colored;
 
@@ -640,7 +705,7 @@ class AinaSpinner {
 
   log(text: string) {
     this.clear();
-    console.log(text);
+    console.log(`${text.startsWith("\n") ? "" : "\n"}${text}`);
     this.draw();
   }
 }
@@ -675,6 +740,10 @@ export class AinaAgent {
 
   changeModel(newModel: string): void {
     this.model = newModel;
+  }
+
+  changeClient(openai: OpenAI): void {
+    this.openai = openai;
   }
 
   getModel(): string {
@@ -1067,6 +1136,7 @@ export class AinaAgent {
         // ---). The trailing, still-in-progress block stays buffered until the end.
         let flushedLen = 0; // chars of contentBuf already printed
         let printedAny = false; // whether any block has been printed this turn
+        let printedThoughtPreview = false;
 
         const beginStream = () => {
           streamingNow = true;
@@ -1077,10 +1147,16 @@ export class AinaAgent {
         // Render `raw` as markdown and append it to scrollback. spinner.log() clears
         // the status bar, prints, then redraws the bar — safe at any height.
         const printBlock = (raw: string) => {
-          if (!raw.trim()) return;
-          const rendered = renderMarkdown(raw);
+          const extracted = extractThoughtPreview(raw);
+          if (extracted.preview && !printedThoughtPreview) {
+            spinner.log(formatThoughtPreview(extracted.preview));
+            printedThoughtPreview = true;
+          }
+          if (!extracted.visible.trim()) return;
+          const rendered = renderMarkdown(extracted.visible);
           if (!rendered) return;
-          spinner.log(printedAny ? `\n${rendered}` : rendered);
+          const output = insetAssistantOutput(rendered);
+          spinner.log(printedAny ? `\n${output}` : output);
           printedAny = true;
         };
 
@@ -1090,8 +1166,9 @@ export class AinaAgent {
           while (true) {
             const pending = contentBuf.slice(flushedLen);
             const stale = Date.now() - lastFlushAt >= STREAM_FALLBACK_FLUSH_MS;
-            const cut = findFlushBoundary(pending, force || stale);
+            const cut = findFlushBoundary(pending, force, STREAM_FALLBACK_FLUSH_CHARS, stale);
             if (cut === -1) break;
+            if (!force && hasUnclosedThoughtTag(pending.slice(0, cut))) break;
             printBlock(pending.slice(0, cut));
             // Consume the run of newlines separating this block from the next.
             let sep = cut;
@@ -1148,9 +1225,10 @@ export class AinaAgent {
         }
 
         const toolCalls = toolCallsAcc.filter(Boolean);
+        const extractedContent = extractThoughtPreview(contentBuf);
         const assistantMessage: any = {
           role: "assistant",
-          content: contentBuf || null,
+          content: extractedContent.visible || null,
         };
         if (toolCalls.length > 0) assistantMessage.tool_calls = toolCalls;
         this.messages.push(assistantMessage);
@@ -1161,7 +1239,7 @@ export class AinaAgent {
         if (contentBuf) {
           // In plan mode the numbered steps of the plan must not be turned into a
           // selection menu — the plan-decision menu (REPL) handles next steps.
-          const parsed = isPlanMode() ? null : parseChoices(contentBuf);
+          const parsed = isPlanMode() ? null : parseChoices(extractedContent.visible);
           if (parsed) {
             this.lastChoices = parsed;
             // The options become the interactive menu, so they must NOT be echoed
@@ -1435,7 +1513,7 @@ export class AinaAgent {
     if (!cancelled) {
       const tokenStr =
         totalTokens > 0 ? ` · ${formatTokens(totalTokens)} token` : "";
-      console.log(chalk.gray(`${doneWord} in ${elapsed}${tokenStr}`));
+      console.log(chalk.gray(`\n${doneWord} in ${elapsed}${tokenStr}`));
     }
 
     // Gap between the process output and the next prompt input below.

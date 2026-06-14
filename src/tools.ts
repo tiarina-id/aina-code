@@ -4,7 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import readline from 'node:readline';
 import { stdin as input, stdout as output } from 'node:process';
 import chalk from 'chalk';
-import { loadConfig, getPrettyModelName } from './config.js';
+import { getActiveProvider, loadConfig, getPrettyModelName } from './config.js';
 import { renderDiff } from './diff.js';
 import { isAutoMode, isPlanMode, setMode, footerRight } from './mode.js';
 import { loadIgnore, type IgnoreMatcher } from './gitignore.js';
@@ -448,17 +448,23 @@ async function askUserPermission(promptText: string): Promise<boolean> {
       const allText = selectedIndex === 1 ? chalk.bgCyan.black(' All steps this turn ') : chalk.gray(' All steps this turn ');
       const alwaysText = selectedIndex === 2 ? chalk.bgCyan.black(' Always ') : chalk.gray(' Always ');
       const rejectText = selectedIndex === 3 ? chalk.bgRed.black(' No ') : chalk.gray(' No ');
-      const mainLine = `${promptText}   ${approveText}  ${allText}  ${alwaysText}  ${rejectText}`;
+      const inset = '  ';
+      const mainLine = `${inset}${chalk.bold(promptText)}`;
+      const optionLine = `${inset}${approveText}  ${allText}  ${alwaysText}  ${rejectText}`;
 
       const config = loadConfig();
-      const prettyModel = getPrettyModelName(config.model);
+      const provider = getActiveProvider(config);
+      const prettyModel = getPrettyModelName(config.activeModel || 'no model');
+      const footerModel = provider ? `${provider.name} · ${prettyModel}` : prettyModel;
       const leftText = '←/→ select · enter ok · s: all steps this turn · a: always · esc cancel';
-      const right = footerRight(prettyModel);
+      const right = footerRight(footerModel);
       const padding = Math.max(0, cols - leftText.length - right.raw.length - 2);
       const footer = chalk.gray(leftText) + ' '.repeat(padding) + right.colored;
 
       const lines = [
+        '',
         mainLine,
+        optionLine,
         horizontalLine,
         footer
       ];

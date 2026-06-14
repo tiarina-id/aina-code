@@ -61,6 +61,73 @@ function prettyRelPath(filePath: string): string {
 
 const CONTEXT = 3; // context lines around each change
 const MAX_LINES = 40; // cap on printed diff lines
+const LEFT_MARGIN = "  ";
+const RIGHT_MARGIN = 3;
+
+function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function expandTabs(text: string): string {
+  return text.replace(/\t/g, "  ");
+}
+
+function padAnsiLine(text: string, width: number): string {
+  const plainLength = stripAnsi(text).length;
+  return text + " ".repeat(Math.max(0, width - plainLength));
+}
+
+type StyleName = "normal" | "keyword" | "string" | "comment" | "number" | "dim";
+interface CodeToken { text: string; style: StyleName }
+
+const tokenPattern = /(\/\/.*$|#.*$)|(`[^`]*`|"(?:\\.|[^"])*"|'(?:\\.|[^'])*')|\b(function|func|const|let|var|return|if|else|for|range|package|import|type|struct|interface|go|defer|switch|case|default|map|string|int|bool|error)\b|\b\d+(?:\.\d+)?\b/g;
+
+function tokenizeCode(text: string): CodeToken[] {
+  const expanded = expandTabs(text);
+  const tokens: CodeToken[] = [];
+  let last = 0;
+  for (const match of expanded.matchAll(tokenPattern)) {
+    const index = match.index ?? 0;
+    if (index > last) tokens.push({ text: expanded.slice(last, index), style: "normal" });
+    const value = match[0];
+    const style: StyleName = match[1] ? "comment" : match[2] ? "string" : match[3] ? "keyword" : "number";
+    tokens.push({ text: value, style });
+    last = index + value.length;
+  }
+  if (last < expanded.length) tokens.push({ text: expanded.slice(last), style: "normal" });
+  return tokens;
+}
+
+function applyFg(text: string, style: StyleName): string {
+  if (style === "keyword") return chalk.cyan(text);
+  if (style === "string") return chalk.hex("#d19a66")(text);
+  if (style === "comment") return chalk.green.dim(text);
+  if (style === "number") return chalk.cyanBright(text);
+  if (style === "dim") return chalk.dim(text);
+  return text;
+}
+
+function renderTokens(tokens: CodeToken[], background?: (s: string) => string, dimAll = false): string {
+  return tokens.map((token) => {
+    const fg = applyFg(token.text, dimAll && token.style === "normal" ? "dim" : token.style);
+    return background ? background(fg) : fg;
+  }).join("");
+}
+
+function highlightCode(text: string): string {
+  return renderTokens(tokenizeCode(text));
+}
+
+function blockRow(numStr: string, sign: string, text: string, color: "add" | "del"): string {
+  const width = Math.max(40, (process.stdout.columns || 100) - RIGHT_MARGIN);
+  const bg = color === "add" ? chalk.bgHex("#123524") : chalk.bgHex("#3a1c1c");
+  const signColor = color === "add" ? chalk.green : chalk.red;
+  const prefix = `${numStr} ${signColor(sign)} `;
+  const tokens = tokenizeCode(text);
+  const plainLength = stripAnsi(prefix).length + tokens.reduce((sum, token) => sum + token.text.length, 0);
+  const padding = " ".repeat(Math.max(0, width - LEFT_MARGIN.length - plainLength));
+  return LEFT_MARGIN + bg(prefix) + renderTokens(tokens, bg, color === "del") + bg(padding);
+}
 
 /**
  * Render a Claude-Code-style file diff:
@@ -94,7 +161,7 @@ export function renderDiff(
     summaryParts.push(`Removed ${removed} line${removed !== 1 ? "s" : ""}`);
   const summary = summaryParts.length ? summaryParts.join(", ") : "No changes";
 
-  const out: string[] = [header, "  " + chalk.gray(`⎿ ${summary}`)];
+  const out: string[] = [LEFT_MARGIN + header, LEFT_MARGIN + "  " + chalk.gray(`⎿ ${summary}`)];
   if (!added && !removed) return out.join("\n");
 
   // Mark which lines to show (changes + surrounding context)
@@ -116,21 +183,21 @@ export function renderDiff(
   for (let idx = 0; idx < diff.length; idx++) {
     if (!show[idx]) continue;
     if (shown >= MAX_LINES) {
-      out.push("       " + chalk.gray("... (truncated)"));
+      out.push(LEFT_MARGIN + "       " + chalk.gray("... (truncated)"));
       break;
     }
     if (lastIdx >= 0 && idx - lastIdx > 1) {
-      out.push("       " + chalk.gray("⋮"));
+      out.push(LEFT_MARGIN + "       " + chalk.gray("⋮"));
     }
     const d = diff[idx];
     const no = d.type === "del" ? d.oldNo : d.newNo;
     const numStr = chalk.gray(String(no ?? "").padStart(5));
     if (d.type === "add") {
-      out.push(`${numStr} ${chalk.green("+")} ${chalk.green(d.text)}`);
+      out.push(blockRow(numStr, "+", d.text, "add"));
     } else if (d.type === "del") {
-      out.push(`${numStr} ${chalk.red("-")} ${chalk.red(d.text)}`);
+      out.push(blockRow(numStr, "-", d.text, "del"));
     } else {
-      out.push(`${numStr}   ${chalk.gray(d.text)}`);
+      out.push(`${LEFT_MARGIN}${numStr} ${chalk.gray(" │ ")} ${chalk.gray(highlightCode(d.text))}`);
     }
     shown++;
     lastIdx = idx;

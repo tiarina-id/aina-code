@@ -48,13 +48,20 @@ the config file):
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `AINA_API_KEY`  | Your Tiarina API key (required) | — |
-| `AINA_MODEL`    | Default model | `aina-1-flash` |
-| `AINA_BASE_URL` | Gateway base URL | `https://api.tiarina.id/v1` |
+| `AINA_PROVIDER` | Provider id (`tiarina`, `openai`, `openrouter`, or custom id) | — |
+| `AINA_API_KEY`  | Provider API key | — |
+| `AINA_MODEL`    | Default model | provider default |
+| `AINA_BASE_URL` | Base URL for custom OpenAI-compatible providers | preset provider URL |
 | `AINA_AUTO_VALIDATE` | Auto typecheck/lint after edits (`false`/`0` disables) | `true` |
 | `AINA_VALIDATE_CMD`  | Override the validation command (e.g. `npm run typecheck`) | auto-detected |
 
-You can view or change settings at any time from inside the app with `/config`.
+On first run, AINA opens an interactive provider setup wizard. Tiarina API is
+recommended and only requires an API key. OpenAI and OpenRouter also only need
+an API key; custom OpenAI-compatible providers ask for name, URL, and key.
+You can manage providers later with `/provider` and view settings with `/config`.
+Provider setup validates the connection by fetching models first. First-run
+uses the first fetched model automatically; adding a provider later saves it
+without switching away from your active provider.
 
 ## Usage
 
@@ -81,6 +88,7 @@ aina --help                            # print help
 | Command | Action |
 |---------|--------|
 | `/help` | Show help |
+| `/provider` | Manage OpenAI-compatible providers |
 | `/model [name]` | Show or switch the active model |
 | `/init` | Generate/update `AINA.md` (project context) |
 | `/undo` | Undo the last file change (write/edit/delete/move) |
@@ -102,7 +110,27 @@ aina --help                            # print help
 
 Press `Esc` to cancel a running task.
 
-## Models
+## Providers & models
+
+AINA supports OpenAI-compatible providers:
+
+| Provider | Setup | Default/preset models |
+|----------|-------|-----------------------|
+| Tiarina API (recommended) | API key only | `aina-1-flash`, `aina-1-mini` |
+| OpenAI | API key only | fetched from OpenAI, fallback `gpt-5.5` |
+| OpenRouter | API key only | fetched from OpenRouter, fallback `openai/gpt-5.5` |
+| OpenAI Compatible | name, base URL, API key | fetched from provider |
+
+The `/provider` manager validates and caches model lists before saving new keys.
+The `/model` picker shows provider headers with indented model choices, so you
+can select a visible model directly or open `More Models` for a provider. Type in
+the outer picker to search across providers; type inside provider details to
+search only that provider. Manual model IDs are still supported.
+
+If a provider emits explicit `<thought>` or `<think>` text, AINA shows a short
+dimmed thinking preview above the answer and hides the raw tags from the reply.
+
+### Tiarina models
 
 | ID | Name |
 |----|------|
@@ -124,11 +152,12 @@ search and the file picker respect your `.gitignore`.
 
 ## Privacy
 
-- Your API key is read from `AINA_API_KEY` or `~/.ainacode/config.json` (stored
-  locally). Without a key, `aina` stops with a clear message.
+- Provider API keys are read from `AINA_API_KEY` or `~/.ainacode/config.json`
+  (stored locally). Without a configured provider, `aina` opens setup or stops
+  with a clear message in non-interactive mode.
 - Files you read or `@`-attach, and commands you run, are sent to the
-  `api.tiarina.id` gateway as part of the context. Respecting `.gitignore` helps
-  avoid sending secrets (e.g. `.env`) by accident.
+  active provider as part of the context. Respecting `.gitignore` helps avoid
+  sending secrets (e.g. `.env`) by accident.
 - Your resumable session history is stored locally under
   `~/.ainacode/sessions/<uuid>.json`, with the latest pointer at
   `~/.ainacode/last-session.json`.

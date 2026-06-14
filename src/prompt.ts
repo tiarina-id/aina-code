@@ -2,7 +2,15 @@ import readline from 'node:readline';
 import chalk from 'chalk';
 import fs from 'node:fs';
 import path from 'node:path';
-import { getPrettyModelName, loadConfig } from './config.js';
+import {
+  buildModelTreeItems,
+  filterModelOptions,
+  getActiveProvider,
+  getPrettyModelName,
+  loadConfig,
+  type ModelTreeItem,
+  type ProviderConfig,
+} from './config.js';
 import { cycleMode, footerRight } from './mode.js';
 import { loadIgnore } from './gitignore.js';
 
@@ -14,6 +22,7 @@ interface SlashCommand {
 
 const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/help', description: 'Show interactive command help' },
+  { name: '/provider', description: 'Manage OpenAI-compatible providers' },
   { name: '/model', description: 'Show the active model or switch models' },
   { name: '/init', description: 'Auto-create/update AINA.md (project context)' },
   { name: '/undo', description: 'Undo the last file change' },
@@ -31,12 +40,33 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/exit', description: 'Exit the interactive session' }
 ];
 
-const AVAILABLE_MODELS: SlashCommand[] = [
-  { name: 'aina-1-flash', description: 'Aina 1 Flash (Default, Fast & Balanced)' },
-  { name: 'aina-1-mini', description: 'Aina 1 Mini (Lightweight & Super Fast)' },
-  { name: 'aina-1-pro', description: 'Aina 1 Pro (Advanced Reasoning & Coding)' },
-  { name: 'aina-1-ultra', description: 'Aina 1 Ultra (Maximum Intelligence)' }
-];
+function getAvailableModels(query = ''): SlashCommand[] {
+  const provider = getActiveProvider(loadConfig());
+  if (!provider) {
+    return ['aina-1-flash', 'aina-1-mini'].map((model) => ({ name: model, description: `Model · ${getPrettyModelName(model)}` }));
+  }
+  return filterModelOptions(provider, query).map((model) => ({ name: model.id, description: `${provider.name} · ${model.label}` }));
+}
+
+function getActiveProviderModelLabel(fallbackModel: string): string {
+  const config = loadConfig();
+  const provider = getActiveProvider(config);
+  const prettyModel = getPrettyModelName(config.activeModel || fallbackModel || 'no model');
+  return provider ? `${provider.name} · ${prettyModel}` : prettyModel;
+}
+
+function truncateMiddle(text: string, max = 42): string {
+  if (text.length <= max) return text;
+  const head = Math.max(8, Math.floor((max - 1) * 0.58));
+  const tail = Math.max(6, max - head - 1);
+  return `${text.slice(0, head)}…${text.slice(-tail)}`;
+}
+
+function modelDisplayLine(model: string, indent = ''): string {
+  const pretty = getPrettyModelName(model);
+  const raw = pretty.toLowerCase() === model.toLowerCase() ? '' : `  ${chalk.gray(truncateMiddle(model))}`;
+  return `${indent}${pretty}${raw}`;
+}
 
 // Submitted prompts, kept for the whole session so ↑/↓ can recall them.
 const promptHistory: string[] = [];
@@ -182,7 +212,7 @@ export function askCustomPrompt(modelName: string): Promise<string> {
 
       if (menuState === 'models') {
         const query = inputBuffer.toLowerCase();
-        const matches = AVAILABLE_MODELS.filter(m => m.name.includes(query));
+        const matches = getAvailableModels(query);
         if (matches.length === 1 && matches[0].name === query) {
           return [];
         }
@@ -308,7 +338,7 @@ export function askCustomPrompt(modelName: string): Promise<string> {
           lines.push(chalk.gray('  ↑/↓ Navigate · enter Select · esc Back/Cancel'));
         }
       } else {
-        const right = footerRight(modelName);
+        const right = footerRight(getActiveProviderModelLabel(modelName));
         if (isShellMode) {
           const leftText = '! bash mode (esc to cancel)';
           const padding = Math.max(0, cols - leftText.length - right.raw.length);
@@ -410,11 +440,9 @@ export function askCustomPrompt(modelName: string): Promise<string> {
           return;
         }
         if (key.name === 'm') {
-          menuState = 'models';
-          inputBuffer = '';
-          cursorOffset = 0;
-          selectedIndex = 0;
-          draw();
+          inputBuffer = '/model';
+          cleanup(true);
+          resolve(inputBuffer);
           return;
         }
         if (key.name === 'l') {
@@ -489,11 +517,9 @@ export function askCustomPrompt(modelName: string): Promise<string> {
           if (menuState === 'commands') {
             const selected = filtered[selectedIndex].name;
             if (selected === '/model') {
-              menuState = 'models';
-              inputBuffer = '';
-              cursorOffset = 0;
-              selectedIndex = 0;
-              draw();
+              inputBuffer = '/model';
+              cleanup(true);
+              resolve(inputBuffer);
             } else if (selected === '/help') {
               menuState = 'help';
               inputBuffer = '';
@@ -667,14 +693,17 @@ export function askInteractiveChoice(question: string, options: string[]): Promi
       options.forEach((opt, idx) => {
         const isSelected = idx === selectedIndex;
         const indicator = isSelected ? chalk.bold.cyan(' ● ') : chalk.gray(' ○ ');
-        const text = isSelected ? chalk.bgCyan.black(` ${opt} `) : chalk.gray(` ${opt} `);
-        lines.push(`${indicator}${text}`);
+        const optionLines = opt.split('\n');
+        optionLines.forEach((line, lineIndex) => {
+          const prefix = lineIndex === 0 ? indicator : '   ';
+          const text = isSelected ? chalk.bgCyan.black(` ${line} `) : chalk.gray(` ${line} `);
+          lines.push(`${prefix}${text}`);
+        });
       });
 
       lines.push(horizontalLine);
 
-      const config = loadConfig();
-      const prettyModel = getPrettyModelName(config.model);
+      const prettyModel = getActiveProviderModelLabel('no model');
       const leftText = '? for shortcuts (esc to interrupt)';
       const right = footerRight(prettyModel);
       const padding = Math.max(0, cols - leftText.length - right.raw.length - 2);
@@ -729,6 +758,279 @@ export function askInteractiveChoice(question: string, options: string[]): Promi
       // Cleanly clear all lines from the first line downwards
       process.stdout.write('\r\x1B[J');
     }
+  });
+}
+
+export type ModelTreeChoice =
+  | { type: 'model'; provider: ProviderConfig; model: string }
+  | { type: 'more-models'; provider: ProviderConfig }
+  | { type: 'cancel' };
+
+export type ProviderModelChoice =
+  | { type: 'model'; model: string }
+  | { type: 'custom' }
+  | { type: 'cancel' };
+
+export function askProviderModelChoice(provider: ProviderConfig, limit = 10): Promise<ProviderModelChoice> {
+  return new Promise<ProviderModelChoice>((resolve) => {
+    const models = provider.modelsCache || [];
+    if (!process.stdin.isTTY) {
+      resolve(models[0] ? { type: 'model', model: models[0] } : { type: 'cancel' });
+      return;
+    }
+
+    const wasRaw = process.stdin.isRaw;
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    readline.emitKeypressEvents(process.stdin);
+
+    let query = '';
+    let selectedIndex = 0;
+    let lastLineCount = 0;
+
+    const matchingModels = () => {
+      const normalized = query.trim().toLowerCase();
+      return models.filter((model) => !normalized || model.toLowerCase().includes(normalized) || getPrettyModelName(model).toLowerCase().includes(normalized));
+    };
+    const items = () => {
+      const matches = matchingModels().slice(0, limit).map((model) => ({ type: 'model' as const, model }));
+      return [...matches, { type: 'custom' as const }];
+    };
+
+    function redraw() {
+      if (lastLineCount > 0) process.stdout.write('\r\x1B[J');
+      const currentItems = items();
+      if (selectedIndex >= currentItems.length) selectedIndex = Math.max(0, currentItems.length - 1);
+      const cols = process.stdout.columns || 80;
+      const horizontalLine = chalk.gray('─'.repeat(Math.max(1, cols - 2)));
+      const total = matchingModels().length;
+      const lines: string[] = [chalk.bgCyan.black(' Models ') + ' ' + chalk.bold.white(`${provider.name} Models`)];
+      if (query) lines.push(chalk.gray('Search: ') + chalk.cyan(query));
+      if (total > limit) lines.push(chalk.gray(`Showing ${limit} of ${total} matches. Type more to narrow results.`));
+      lines.push('');
+
+      if (total === 0) {
+        lines.push(chalk.gray('  No matching models. Keep typing or press Esc to clear search.'));
+      }
+
+      currentItems.forEach((item, index) => {
+        const isSelected = index === selectedIndex;
+        const cursor = isSelected ? chalk.bold.cyan('› ') : '  ';
+        if (item.type === 'model') {
+          const label = modelDisplayLine(item.model);
+          lines.push(`${cursor}${isSelected ? chalk.cyan(label) : chalk.gray(label)}`);
+        } else {
+          const label = 'Use Custom Model ID';
+          lines.push(`${cursor}${isSelected ? chalk.cyan(label) : chalk.gray(label)}`);
+        }
+      });
+
+      lines.push(horizontalLine);
+      lines.push(chalk.gray('↑/↓ Navigate · type Search · enter Select · esc Back/Cancel'));
+      process.stdout.write(lines.join('\n'));
+      lastLineCount = lines.length;
+      process.stdout.write(`\r\x1B[${lines.length - 1}A`);
+    }
+
+    function cleanup() {
+      process.stdin.removeListener('keypress', onKeypress);
+      process.stdin.setRawMode(wasRaw);
+      process.stdout.write('\r\x1B[J');
+    }
+
+    const onKeypress = (str: string, key: any) => {
+      if (key?.ctrl && key.name === 'c') {
+        cleanup();
+        process.exit(0);
+      }
+      if (key?.name === 'up') {
+        selectedIndex = (selectedIndex - 1 + items().length) % items().length;
+        redraw();
+        return;
+      }
+      if (key?.name === 'down') {
+        selectedIndex = (selectedIndex + 1) % items().length;
+        redraw();
+        return;
+      }
+      if (key?.name === 'backspace') {
+        query = query.slice(0, -1);
+        selectedIndex = 0;
+        redraw();
+        return;
+      }
+      if (key?.name === 'escape') {
+        if (query) {
+          query = '';
+          selectedIndex = 0;
+          redraw();
+          return;
+        }
+        cleanup();
+        resolve({ type: 'cancel' });
+        return;
+      }
+      if (key?.name === 'return') {
+        const item = items()[selectedIndex];
+        cleanup();
+        if (!item) resolve({ type: 'cancel' });
+        else if (item.type === 'model') resolve({ type: 'model', model: item.model });
+        else resolve({ type: 'custom' });
+        return;
+      }
+      if (str && str.length === 1 && str >= ' ' && !key?.ctrl && !key?.meta) {
+        query += str;
+        selectedIndex = 0;
+        redraw();
+      }
+    };
+
+    process.stdin.on('keypress', onKeypress);
+    redraw();
+  });
+}
+
+export function askModelTreeChoice(providers: ProviderConfig[]): Promise<ModelTreeChoice> {
+  return new Promise<ModelTreeChoice>((resolve) => {
+    if (!process.stdin.isTTY) {
+      const firstModel = buildModelTreeItems(providers).find((item) => item.type === 'model') as Extract<ModelTreeItem, { type: 'model' }> | undefined;
+      resolve(firstModel ? { type: 'model', provider: firstModel.provider, model: firstModel.model } : { type: 'cancel' });
+      return;
+    }
+
+    const wasRaw = process.stdin.isRaw;
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    readline.emitKeypressEvents(process.stdin);
+
+    let query = '';
+    let providerLimit = 2;
+    let selectedIndex = 0;
+    let lastLineCount = 0;
+
+    const selectable = (item: ModelTreeItem) => item.type === 'model' || item.type === 'more-models' || item.type === 'more-providers';
+    const items = () => buildModelTreeItems(providers, query, providerLimit, 3);
+    const selectableIndexes = () => items().map((item, index) => selectable(item) ? index : -1).filter((index) => index !== -1);
+    const ensureSelectable = () => {
+      const indexes = selectableIndexes();
+      if (indexes.length === 0) return;
+      if (!indexes.includes(selectedIndex)) selectedIndex = indexes[0];
+    };
+
+    function redraw() {
+      if (lastLineCount > 0) process.stdout.write('\r\x1B[J');
+      ensureSelectable();
+      const cols = process.stdout.columns || 80;
+      const horizontalLine = chalk.gray('─'.repeat(Math.max(1, cols - 2)));
+      const lines: string[] = [];
+      lines.push(chalk.bgCyan.black(' Models ') + ' ' + chalk.bold.white('Choose a model'));
+      if (query) lines.push(chalk.gray('Search: ') + chalk.cyan(query));
+      lines.push('');
+
+      const currentItems = items();
+      if (currentItems.length === 0) {
+        lines.push(chalk.gray('  No matching models. Keep typing or press Esc to clear search.'));
+      }
+      currentItems.forEach((item, index) => {
+        const isSelected = index === selectedIndex && selectable(item);
+        const cursor = isSelected ? chalk.bold.cyan('› ') : '  ';
+        if (item.type === 'provider') {
+          const count = item.provider.modelsCache?.length || 0;
+          lines.push(`${chalk.cyan.bold(item.provider.name)} ${chalk.gray(`· ${count} models`)}`);
+        } else if (item.type === 'model') {
+          const label = modelDisplayLine(item.model, '  ├ ');
+          lines.push(`${cursor}${isSelected ? chalk.cyan(label) : chalk.gray(label)}`);
+        } else if (item.type === 'more-models') {
+          const label = `  └ +${item.hiddenCount} More Models`;
+          lines.push(`${cursor}${isSelected ? chalk.cyan(label) : chalk.gray(label)}`);
+        } else {
+          const label = `+${item.hiddenCount} More Providers`;
+          lines.push(`${cursor}${isSelected ? chalk.cyan(label) : chalk.gray(label)}`);
+        }
+      });
+
+      lines.push(horizontalLine);
+      lines.push(chalk.gray('↑/↓ Navigate · type Search · enter Select · esc Back/Cancel'));
+      process.stdout.write(lines.join('\n'));
+      lastLineCount = lines.length;
+      process.stdout.write(`\r\x1B[${lines.length - 1}A`);
+    }
+
+    const move = (direction: 1 | -1) => {
+      const indexes = selectableIndexes();
+      if (indexes.length === 0) return;
+      const current = indexes.indexOf(selectedIndex);
+      const next = current === -1 ? 0 : (current + direction + indexes.length) % indexes.length;
+      selectedIndex = indexes[next];
+    };
+
+    function cleanup() {
+      process.stdin.removeListener('keypress', onKeypress);
+      process.stdin.setRawMode(wasRaw);
+      process.stdout.write('\r\x1B[J');
+    }
+
+    const onKeypress = (str: string, key: any) => {
+      if (key?.ctrl && key.name === 'c') {
+        cleanup();
+        process.exit(0);
+      }
+      if (key?.name === 'up') {
+        move(-1);
+        redraw();
+        return;
+      }
+      if (key?.name === 'down') {
+        move(1);
+        redraw();
+        return;
+      }
+      if (key?.name === 'backspace') {
+        query = query.slice(0, -1);
+        selectedIndex = 0;
+        redraw();
+        return;
+      }
+      if (key?.name === 'escape') {
+        if (query) {
+          query = '';
+          selectedIndex = 0;
+          redraw();
+          return;
+        }
+        cleanup();
+        resolve({ type: 'cancel' });
+        return;
+      }
+      if (key?.name === 'return') {
+        const item = items()[selectedIndex];
+        if (!item) return;
+        if (item.type === 'model') {
+          cleanup();
+          resolve({ type: 'model', provider: item.provider, model: item.model });
+          return;
+        }
+        if (item.type === 'more-models') {
+          cleanup();
+          resolve({ type: 'more-models', provider: item.provider });
+          return;
+        }
+        if (item.type === 'more-providers') {
+          providerLimit += item.hiddenCount;
+          selectedIndex = 0;
+          redraw();
+        }
+        return;
+      }
+      if (str && str.length === 1 && str >= ' ' && !key?.ctrl && !key?.meta) {
+        query += str;
+        selectedIndex = 0;
+        redraw();
+      }
+    };
+
+    process.stdin.on('keypress', onKeypress);
+    redraw();
   });
 }
 
